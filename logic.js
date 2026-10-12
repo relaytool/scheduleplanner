@@ -71,11 +71,17 @@
     const hsc = normalizeText(row.hsc).toUpperCase();
     const loadType = normalizeText(row.loadType).toUpperCase();
     const postcode = normalizeText(row.postcode).toUpperCase();
+
+    // Returns are eligible for this movement path only when their HSC is UB11.
+    // Intercity movements keep the original NG15/WS2 + UB11 postcode conditions.
+    if (loadType.includes('RETURNS')) return hsc === 'UB11';
     return (hsc === 'NG15' || hsc === 'WS2') && loadType.includes('INTERCITY') && postcode.includes('UB11');
   }
 
   function isCase1(row) {
-    return normalizeText(row.hsc).toUpperCase() === 'UB11';
+    // UB11 rows are ordinarily Case 1, except Returns rows which use the
+    // Case 2 timing/completion rules and are identified by isCase2 above.
+    return normalizeText(row.hsc).toUpperCase() === 'UB11' && !normalizeText(row.loadType).toUpperCase().includes('RETURNS');
   }
 
   function chooseScheduleMode(rows) {

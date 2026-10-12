@@ -237,11 +237,12 @@
         driverName: textValue(cell(row, ix.driverName)),
         sourceSheetRow: String(i + 1)
       };
-      // Keep both eligible movement types in the same shift schedule.
+      // Keep ordinary UB11, qualifying Intercity, and UB11 Returns movements in the same shift schedule.
       if (!L.isCase1(record) && !L.isCase2(record)) continue;
       record.caseType = L.isCase2(record) ? 'CASE2' : 'CASE1';
-      // UB11 movements are scheduled from ETA to HSC (L). Intercity departures
-      // from NG15/WS2 use Actual Arrival (I), falling back to Planned Arrival (H).
+      // Ordinary UB11 movements are scheduled from ETA to HSC (L). Intercity movements
+      // from NG15/WS2 and Returns movements at UB11 use Actual Arrival (I),
+      // falling back to Planned Arrival (H).
       const eventTime = L.scheduledTime(record);
       const eventIso = localIsoTime(record.sourceDate, eventTime);
       if (!eventIso) continue;
@@ -516,7 +517,7 @@
         const event = new Date(row.eventTimeISO);
         return event >= state.activeShift.start && event < state.activeShift.end;
       });
-      // Keep every eligible UB11 and qualifying Intercity movement in this shift.
+      // Keep every eligible ordinary UB11, qualifying Intercity, and UB11 Returns movement in this shift.
       const chosen = L.selectSchedule(scoped);
       const selected = chosen.rows;
       const existingValues = await readTab(cfg.destinationTabs.schedule, HEADERS.length);
@@ -531,7 +532,7 @@
         const rowIsUb11 = sourceRow.caseType === 'CASE1';
         const rowIsIntercity = sourceRow.caseType === 'CASE2';
         // The completion trigger follows the relevant source field: actual arrival at UB11 (M)
-        // for UB11 movements, and actual pull from NG15/WS2 (K) for Intercity movements.
+        // for ordinary UB11 movements, and Actual Pull (K) for Intercity and UB11 Returns movements.
         const sourceCompletionTime = L.completionTime(sourceRow);
         const autoCompleted = L.toMinutes(sourceCompletionTime) !== null;
         const calculatedHscMinutes = rowIsIntercity ? L.timeAtHSCMinutes(sourceRow) : null;
@@ -598,7 +599,7 @@
         <h1>Build your shift schedule.</h1>
         <p>Sign in with the Google account that can edit the separate schedule workbook. The RHS tracker is read as the source of truth; bays, docked status, completion times and shift links are written to the destination workbook.</p>
         <div class="login-grid">
-          <div class="login-info"><span class="info-dot">↻</span><div><b>Live tracker sync</b><p>Loads all eligible UB11 and qualifying Intercity movements together for the selected shift.</p></div></div>
+          <div class="login-info"><span class="info-dot">↻</span><div><b>Live tracker sync</b><p>Loads UB11 movements, qualifying Intercity movements, and Returns only when HSC is UB11.</p></div></div>
           <div class="login-info"><span class="info-dot">⌖</span><div><b>Yard marshall link</b><p>Generate a QR code and a shift-only link. The public view displays a rolling two-hour window and does not ask the marshall to sign in.</p></div></div>
         </div>
         ${isError && errorText ? `<div class="notice error"><strong>Connection issue:</strong> ${escapeHtml(errorText)}</div>` : ''}
@@ -632,7 +633,7 @@
         <div class="stat-card"><div class="stat-top">Docked <span class="stat-icon">⌖</span></div><div class="stat-value">${docked}</div><div class="stat-caption">Bay assigned, not yet complete</div></div>
         <div class="stat-card"><div class="stat-top">Outstanding <span class="stat-icon">◷</span></div><div class="stat-value">${outstanding}</div><div class="stat-caption">Planned or currently docked</div></div>
       </div>
-      <div class="notice"><strong>${escapeHtml(shift.label)} · ${escapeHtml(fmtDate(shift.start, { weekday: 'long', day: '2-digit', month: 'short' }))}</strong> &nbsp; Showing all eligible movements for the full shift, including UB11 movements and qualifying Intercity movements to UB11. Future movements remain in the timeline through shift end; completed movements are grouped above the outstanding schedule.</div>
+      <div class="notice"><strong>${escapeHtml(shift.label)} · ${escapeHtml(fmtDate(shift.start, { weekday: 'long', day: '2-digit', month: 'short' }))}</strong> &nbsp; Showing all eligible movements for the full shift, including ordinary UB11 movements, qualifying Intercity movements to UB11, and Returns only when HSC is UB11. Future movements remain in the timeline through shift end; completed movements are grouped above the outstanding schedule.</div>
       <section class="schedule-layout">
         <div class="schedule-toolbar">
           <div class="toolbar-left"><div class="shift-icon">◷</div><div><div class="section-title">Shift timeline</div><div class="section-subtitle">${escapeHtml(fmtDate(shift.start, { day: '2-digit', month: 'short' }))} ${fmtClock(shift.start)} to ${escapeHtml(fmtDate(shift.end, { day: '2-digit', month: 'short' }))} ${fmtClock(shift.end)} · Updated ${fmtClock(new Date())}</div></div></div>
