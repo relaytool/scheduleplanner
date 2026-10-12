@@ -21,13 +21,14 @@
     return h * 60 + m;
   };
 
-  function durationMinutes(actualArrivalAtHsc, plannedPull) {
-    const actual = toMinutes(actualArrivalAtHsc);
-    const planned = toMinutes(plannedPull);
-    if (actual === null || planned === null) return null;
-    let difference = actual - planned;
-    // Adjust for a genuine midnight crossover, but preserve small negative offsets.
+  // Elapsed time from a start clock time to an end clock time, including midnight crossover.
+  function durationMinutes(endTime, startTime) {
+    const end = toMinutes(endTime);
+    const start = toMinutes(startTime);
+    if (end === null || start === null) return null;
+    let difference = end - start;
     if (difference < -720) difference += 1440;
+    else if (difference > 720) difference -= 1440;
     return difference;
   }
 
@@ -81,36 +82,55 @@
     return rows.some(isCase2) ? 'CASE2' : 'CASE1';
   }
 
-  function eventMinutes(row, mode) {
-    const rowType = String(row.caseType || '').toUpperCase();
-    if (rowType === 'CASE2' || (!rowType && isCase2(row)) || (rowType !== 'CASE1' && mode === 'CASE2')) {
-      return toMinutes(row.actualArrival) ?? toMinutes(row.plannedArrival);
-    }
-    return toMinutes(row.plannedPull);
+  function movementType(row) {
+    const type = String(row.caseType || '').toUpperCase();
+    if (type === 'CASE1' || type === 'CASE2' || type === 'MANUAL') return type;
+    if (isCase2(row)) return 'CASE2';
+    if (isCase1(row)) return 'CASE1';
+    return 'MANUAL';
+  }
+
+  function scheduledTime(row) {
+    const type = movementType(row);
+    if (type === 'CASE2') return toMinutes(row.actualArrival) !== null ? row.actualArrival : row.plannedArrival;
+    if (type === 'CASE1') return toMinutes(row.etaToHsc) !== null ? row.etaToHsc : row.plannedArrival;
+    return row.scheduledTime || row.eventTimeLocal || row.etaToHsc || row.actualArrival || row.plannedArrival;
+  }
+
+  function completionTime(row) {
+    const type = movementType(row);
+    if (type === 'CASE1') return row.actualArrivalHsc || '';
+    if (type === 'CASE2') return row.actualPull || '';
+    return '';
+  }
+
+  function timeAtHSCMinutes(row) {
+    if (movementType(row) !== 'CASE2') return null;
+    return durationMinutes(row.actualPull, row.actualArrival);
+  }
+
+  function eventMinutes(row) {
+    return toMinutes(scheduledTime(row));
   }
 
   function isCompleted(row) {
     const status = normalizeText(row.operationalStatus || row.status).toLowerCase();
-    return status === 'completed' || status === 'complete' || status === 'done' || (String(row.caseType || '').toUpperCase() !== 'CASE2' && Boolean(toMinutes(row.actualPull)));
+    if (['completed', 'complete', 'done'].includes(status)) return true;
+    const type = movementType(row);
+    if (type === 'CASE2') return toMinutes(row.actualPull) !== null;
+    if (type === 'CASE1') return toMinutes(row.actualArrivalHsc) !== null;
+    return false;
   }
 
   function sortSchedule(rows, mode, now = new Date()) {
     return [...rows].sort((a, b) => {
       const doneA = isCompleted(a) ? 1 : 0;
       const doneB = isCompleted(b) ? 1 : 0;
-      if (doneA !== doneB) return doneB - doneA; // completed entries stay above current/future ones.
-      const dateAForDone = a.eventTimeISO ? new Date(a.eventTimeISO).getTime() : NaN;
-      const dateBForDone = b.eventTimeISO ? new Date(b.eventTimeISO).getTime() : NaN;
-      if (doneA && doneB && Number.isFinite(dateAForDone) && Number.isFinite(dateBForDone) && dateAForDone !== dateBForDone) return dateAForDone - dateBForDone;
+      if (doneA !== doneB) return doneB - doneA;
       const dateA = a.eventTimeISO ? new Date(a.eventTimeISO).getTime() : NaN;
       const dateB = b.eventTimeISO ? new Date(b.eventTimeISO).getTime() : NaN;
       if (Number.isFinite(dateA) && Number.isFinite(dateB)) {
-        const nowMs = new Date(now).getTime();
-        const aPast = dateA < nowMs;
-        const bPast = dateB < nowMs;
-        if (aPast !== bPast) return aPast ? -1 : 1; // overdue-but-unfinished movement is the current focus.
-        if (aPast && bPast && dateA !== dateB) return dateB - dateA; // most recently due first.
-        if (!aPast && !bPast && dateA !== dateB) return dateA - dateB;
+        if (dateA !== dateB) return dateA - dateB;
       } else {
         const ma = eventMinutes(a, mode);
         const mb = eventMinutes(b, mode);
@@ -118,7 +138,6 @@
         if (mb === null && ma !== null) return -1;
         if (ma !== null && mb !== null && ma !== mb) return ma - mb;
       }
-      // Keep docked records visually prominent only when their schedule times tie.
       const dockA = normalizeText(a.operationalStatus).toLowerCase() === 'docked' ? 1 : 0;
       const dockB = normalizeText(b.operationalStatus).toLowerCase() === 'docked' ? 1 : 0;
       if (dockA !== dockB) return dockB - dockA;
@@ -127,8 +146,7 @@
   }
 
   function selectSchedule(rows) {
-    // Both movement rules are shown together. The rule classifies each row only;
-    // the presence of an Intercity movement must never suppress UB11 movements.
+    // Both eligible source movement types are shown together. Classification is internal only.
     const selected = rows.filter(row => isCase1(row) || isCase2(row)).map(row => ({
       ...row,
       caseType: isCase2(row) ? 'CASE2' : 'CASE1'
@@ -157,6 +175,10 @@
     isCase2,
     chooseScheduleMode,
     eventMinutes,
+    scheduledTime,
+    completionTime,
+    timeAtHSCMinutes,
+    movementType,
     isCompleted,
     sortSchedule,
     selectSchedule,
