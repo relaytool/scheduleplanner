@@ -13,7 +13,7 @@ window.APP_CONFIG = {
     links: 'ShiftLinks',
     audit: 'AuditLog'
   },
-  googleOAuthClientId: "50542963972-75ictdqcblqigj1iq30pobdqk06s1v93.apps.googleusercontent.com",
+  googleOAuthClientId: 'YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com',
   sourceFallbackTabName: 'FM collection tracker',
   shiftStartHour: 7,
   dayShiftEndHour: 19,

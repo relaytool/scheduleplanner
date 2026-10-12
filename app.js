@@ -249,6 +249,37 @@
       });
     }
   }
+  function googleErrorForUser(error, stage = 'connecting to Google Sheets') {
+    let apiError = error?.result?.error || error?.error?.error || error?.error || {};
+    if ((!apiError || !apiError.message) && typeof error?.body === 'string') {
+      try {
+        const parsed = JSON.parse(error.body);
+        apiError = parsed?.error || parsed?.response?.error || apiError;
+      } catch (_) { /* The body may be plain text. */ }
+    }
+    const statusCode = Number(apiError.code || error?.status || error?.statusCode || 0);
+    const reason = [apiError.status, ...(apiError.errors || []).map(item => item.reason)].filter(Boolean).join(' ');
+    const detail = String(apiError.message || error?.message || error?.body || 'Unknown Google API error').trim();
+    const diagnostic = `${reason} ${detail}`.toLowerCase();
+
+    if (statusCode === 403 || /service_disabled|permission_denied|access_token_scope_insufficient/.test(diagnostic)) {
+      if (/service_disabled|has not been used|is disabled|disabledapi/.test(diagnostic)) {
+        return `Google Sheets API is disabled for the Google Cloud project linked to this app. Enable “Google Sheets API” in the same Cloud project that owns the OAuth Client ID, then sign out and sign in again. Google response: ${detail}`;
+      }
+      if (/insufficient.*scope|scope.*insufficient|access_token_scope_insufficient/.test(diagnostic)) {
+        return `Google sign-in did not grant the Sheets permission this app needs. Sign out, remove the app's access from your Google Account permissions, then sign in again and accept the spreadsheet access request. Google response: ${detail}`;
+      }
+      if (/quota|rate.?limit|resource_exhausted/.test(diagnostic)) {
+        return `Google Sheets API quota blocked the request while ${stage}. Check API quota in Google Cloud Console. Google response: ${detail}`;
+      }
+      return `Google Sheets returned HTTP 403 while ${stage}. Check that Google Sheets API is enabled in the Cloud project linked to your OAuth Client ID, and that the signed-in Google account can access the destination spreadsheet. The account must be an Editor to create tabs or save bay/completion changes; “Anyone with the link · Viewer” is only for public viewing. Google response: ${detail}`;
+    }
+    if (statusCode === 401) {
+      return `Google rejected the access token while ${stage}. Sign in again and grant spreadsheet access. Google response: ${detail}`;
+    }
+    return `${detail}${statusCode ? ` (HTTP ${statusCode})` : ''}`;
+  }
+
   async function signIn() {
     try {
       await ensureGoogleReady();
@@ -268,8 +299,10 @@
     } catch (error) {
       state.oauthResolver = null;
       state.oauthRejecter = null;
-      toast(error.message || 'Google sign-in failed.', 'error', 8000);
-      renderLogin(error.message || 'Google sign-in failed.');
+      console.error('Relay connection failed:', error, error?.result || error?.body || 'No Google API response body was provided');
+      const message = googleErrorForUser(error, 'opening the destination spreadsheet');
+      toast(message, 'error', 12000);
+      renderLogin(message, true);
     }
   }
   function apiSheets() { return window.gapi.client.sheets.spreadsheets; }
@@ -494,10 +527,10 @@
       renderWarehouse();
       toast(`Shift synced: ${upserts.length} transaction${upserts.length === 1 ? '' : 's'} · ${chosen.mode === 'CASE2' ? 'Case 2 Intercity' : 'Case 1 UB11'}.`, 'success');
     } catch (error) {
-      console.error(error);
-      const message = error?.result?.error?.message || error.message || 'Could not sync the schedule.';
+      console.error('Relay schedule sync failed:', error, error?.result || error?.body || 'No Google API response body was provided');
+      const message = googleErrorForUser(error, 'syncing the source tracker and destination schedule');
       renderLogin(message, true);
-      toast(message, 'error', 9000);
+      toast(message, 'error', 12000);
     }
   }
 
