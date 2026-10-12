@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101a2d">
+  <meta name="description" content="Warehouse and yard marshal shift schedule">
+  <title>Relay | Warehouse & Yard Schedule</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://apis.google.com/js/api.js" async defer></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script>
+  <script src="config.js"></script>
+  <script src="logic.js"></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="Relay schedule home">
+        <span class="brand-mark"><span></span><span></span><span></span></span>
+        <span><strong>RELAY</strong><small>WAREHOUSE OPERATIONS</small></span>
+      </a>
+      <div class="topbar-right">
+        <div id="live-clock" class="live-clock">--:--</div>
+        <span id="shift-chip" class="shift-chip">SHIFT CHECK</span>
+      </div>
+    </header>
+
+    <nav id="main-nav" class="main-nav" aria-label="Main navigation">
+      <button class="nav-tab active" data-view="warehouse"><span class="nav-icon">▦</span> Warehouse schedule</button>
+      <button class="nav-tab" data-view="yard"><span class="nav-icon">⌖</span> Yard marshall view</button>
+    </nav>
+
+    <main id="app-root" class="main-content">
+      <section class="loading-panel"><div class="loader"></div><p>Preparing the schedule…</p></section>
+    </main>
+    <footer class="app-footer"><span>RELAY OPERATIONS</span><span>Day shift 07:00–19:00 · Night shift 19:00–07:00</span></footer>
+  </div>
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+</body>
+</html>

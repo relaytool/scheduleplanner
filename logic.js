@@ -1,0 +1,159 @@
+(function (root) {
+  'use strict';
+
+  const normalizeText = value => String(value ?? '').trim().replace(/\s+/g, ' ');
+  const normalizedHeader = value => normalizeText(value).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const toMinutes = value => {
+    if (value === null || value === undefined || value === '') return null;
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      // Google Sheets serial time fractions are less than 1.
+      if (value >= 0 && value < 1) return Math.round(value * 1440) % 1440;
+      // Accept integer minute counts for internal tests/records.
+      if (Number.isInteger(value) && value >= 0 && value < 1440) return value;
+    }
+    const s = normalizeText(value);
+    if (!s || /^(?:---|n\/a|na|none|null|nothing to collect|closed for today|cancelled!?|tbc)$/i.test(s)) return null;
+    const match = s.match(/(?:^|\b)(\d{1,2}):(\d{2})(?::\d{2})?(?:\b|$)/);
+    if (!match) return null;
+    const h = Number(match[1]);
+    const m = Number(match[2]);
+    if (h > 23 || m > 59) return null;
+    return h * 60 + m;
+  };
+
+  function durationMinutes(actualArrivalAtHsc, plannedPull) {
+    const actual = toMinutes(actualArrivalAtHsc);
+    const planned = toMinutes(plannedPull);
+    if (actual === null || planned === null) return null;
+    let difference = actual - planned;
+    // Adjust for a genuine midnight crossover, but preserve small negative offsets.
+    if (difference < -720) difference += 1440;
+    return difference;
+  }
+
+  function addMinutesToDate(date, minutes) {
+    const copy = new Date(date);
+    copy.setMinutes(copy.getMinutes() + minutes);
+    return copy;
+  }
+
+  function buildShiftWindow(nowValue, startHour = 7, endHour = 19) {
+    const now = new Date(nowValue);
+    const dayStart = new Date(now);
+    dayStart.setHours(startHour, 0, 0, 0);
+    const dayEnd = new Date(now);
+    dayEnd.setHours(endHour, 0, 0, 0);
+    let start;
+    let end;
+    if (now.getHours() < startHour) {
+      start = new Date(dayStart);
+      start.setDate(start.getDate() - 1);
+      start.setHours(endHour, 0, 0, 0);
+      end = new Date(dayStart);
+    } else if (now.getHours() >= endHour) {
+      start = new Date(dayEnd);
+      end = new Date(dayStart);
+      end.setDate(end.getDate() + 1);
+    } else {
+      start = dayStart;
+      end = dayEnd;
+    }
+    return {
+      start,
+      end,
+      type: start.getHours() === endHour ? 'NIGHT' : 'DAY',
+      label: start.getHours() === endHour ? '19:00–07:00' : '07:00–19:00'
+    };
+  }
+
+  function isCase2(row) {
+    const hsc = normalizeText(row.hsc).toUpperCase();
+    const loadType = normalizeText(row.loadType).toUpperCase();
+    const postcode = normalizeText(row.postcode).toUpperCase();
+    return (hsc === 'NG15' || hsc === 'WS2') && loadType.includes('INTERCITY') && postcode.includes('UB11');
+  }
+
+  function isCase1(row) {
+    return normalizeText(row.hsc).toUpperCase() === 'UB11';
+  }
+
+  function chooseScheduleMode(rows) {
+    return rows.some(isCase2) ? 'CASE2' : 'CASE1';
+  }
+
+  function eventMinutes(row, mode) {
+    if (mode === 'CASE2') return toMinutes(row.actualArrival) ?? toMinutes(row.plannedArrival);
+    return toMinutes(row.plannedPull);
+  }
+
+  function isCompleted(row) {
+    const status = normalizeText(row.operationalStatus || row.status).toLowerCase();
+    return status === 'completed' || status === 'complete' || status === 'done' || (String(row.caseType || '').toUpperCase() !== 'CASE2' && Boolean(toMinutes(row.actualPull)));
+  }
+
+  function sortSchedule(rows, mode, now = new Date()) {
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+    return [...rows].sort((a, b) => {
+      const doneA = isCompleted(a) ? 1 : 0;
+      const doneB = isCompleted(b) ? 1 : 0;
+      if (doneA !== doneB) return doneB - doneA; // completed entries stay above current/future ones.
+      const dateAForDone = a.eventTimeISO ? new Date(a.eventTimeISO).getTime() : NaN;
+      const dateBForDone = b.eventTimeISO ? new Date(b.eventTimeISO).getTime() : NaN;
+      if (doneA && doneB && Number.isFinite(dateAForDone) && Number.isFinite(dateBForDone) && dateAForDone !== dateBForDone) return dateAForDone - dateBForDone;
+      const dockA = normalizeText(a.operationalStatus).toLowerCase() === 'docked' ? 1 : 0;
+      const dockB = normalizeText(b.operationalStatus).toLowerCase() === 'docked' ? 1 : 0;
+      if (dockA !== dockB) return dockB - dockA;
+      const dateA = a.eventTimeISO ? new Date(a.eventTimeISO).getTime() : NaN;
+      const dateB = b.eventTimeISO ? new Date(b.eventTimeISO).getTime() : NaN;
+      if (Number.isFinite(dateA) && Number.isFinite(dateB)) {
+        const nowMs = new Date(now).getTime();
+        const aPast = dateA < nowMs;
+        const bPast = dateB < nowMs;
+        if (aPast !== bPast) return aPast ? -1 : 1; // overdue-but-unfinished movement is the current focus.
+        if (aPast && bPast && dateA !== dateB) return dateB - dateA; // most recently due first.
+        if (!aPast && !bPast && dateA !== dateB) return dateA - dateB;
+      } else {
+        const ma = eventMinutes(a, mode);
+        const mb = eventMinutes(b, mode);
+        if (ma === null && mb !== null) return 1;
+        if (mb === null && ma !== null) return -1;
+        if (ma !== null && mb !== null && ma !== mb) return ma - mb;
+      }
+      return normalizeText(a.client).localeCompare(normalizeText(b.client));
+    });
+  }
+
+  function selectSchedule(rows) {
+    const mode = chooseScheduleMode(rows);
+    const selected = rows.filter(mode === 'CASE2' ? isCase2 : isCase1);
+    return { mode, rows: selected };
+  }
+
+  function classifySourceRows(rows) {
+    const selected = selectSchedule(rows);
+    return { mode: selected.mode, rows: selected.rows };
+  }
+
+  function makeStableId(row) {
+    return [row.sourceDate || '', row.hsc || '', row.code || '', row.reg || '', row.client || '', row.loadType || '', row.plannedArrival || '', row.plannedPull || '']
+      .map(value => normalizeText(value).toUpperCase()).join('|');
+  }
+
+  root.ScheduleLogic = {
+    normalizeText,
+    normalizedHeader,
+    toMinutes,
+    durationMinutes,
+    addMinutesToDate,
+    buildShiftWindow,
+    isCase1,
+    isCase2,
+    chooseScheduleMode,
+    eventMinutes,
+    isCompleted,
+    sortSchedule,
+    selectSchedule,
+    classifySourceRows,
+    makeStableId
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : window);
