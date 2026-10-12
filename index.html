@@ -10,6 +10,27 @@
   <script src="https://apis.google.com/js/api.js" async defer></script>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script>
+  <script>
+    // If a project JS file fails to parse or load, replace the static loader with a visible diagnostic.
+    window.addEventListener('error', function (event) {
+      const file = String(event.filename || '').split('/').pop().split('?')[0];
+      if (!['config.js', 'logic.js', 'app.js'].includes(file)) return;
+      const showError = function () {
+        const root = document.getElementById('app-root');
+        if (!root) return;
+        const title = document.createElement('h2');
+        title.textContent = 'Relay could not start';
+        const message = document.createElement('p');
+        message.textContent = file + ' failed to load or contains a JavaScript error. Upload the complete corrected project folder and reload.';
+        const panel = document.createElement('section');
+        panel.className = 'login-panel';
+        panel.append(title, message);
+        root.replaceChildren(panel);
+      };
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', showError, { once: true });
+      else showError();
+    });
+  </script>
   <script src="config.js"></script>
   <script src="logic.js"></script>
   <script src="app.js" defer></script>

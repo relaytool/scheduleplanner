@@ -948,12 +948,25 @@
       if (state.view === 'yard') renderYardView(); else if (state.accessToken) refreshWarehouse(false); else renderLogin();
     });
   }
+  function renderStartupError(message) {
+    if (!root) return;
+    root.innerHTML = `<section class="login-panel"><div class="login-symbol">!</div><div class="eyebrow">Warehouse control desk</div><h1>Relay could not start.</h1><p>The app detected a startup problem instead of leaving the loading screen running indefinitely.</p><div class="notice error"><strong>Startup error:</strong> ${escapeHtml(message)}</div><p>Check that <code>config.js</code>, <code>logic.js</code> and <code>app.js</code> are uploaded together from the same project version.</p><button id="retry-app" class="btn primary">Reload application</button></section>`;
+    $('#retry-app')?.addEventListener('click', () => location.reload());
+  }
   async function boot() {
-    handleNavigation();
-    updateClock();
-    setInterval(updateClock, 15000);
-    if (state.view === 'yard') renderYardView();
-    else renderLogin();
+    try {
+      if (!cfg) throw new Error('config.js did not load. Check for a JavaScript syntax error and redeploy the corrected file.');
+      if (!L) throw new Error('logic.js did not load. Upload the complete project folder, including logic.js.');
+      if (!root) throw new Error('The app root element is missing from index.html.');
+      handleNavigation();
+      updateClock();
+      setInterval(updateClock, 15000);
+      if (state.view === 'yard') renderYardView();
+      else renderLogin();
+    } catch (error) {
+      console.error('Relay startup failed:', error);
+      renderStartupError(error?.message || 'Unknown startup error.');
+    }
   }
   document.addEventListener('DOMContentLoaded', boot);
 })();
