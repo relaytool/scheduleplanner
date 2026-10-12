@@ -20,7 +20,7 @@
     persistedScheduleRowCount: 1,
     shiftRows: [],
     activeShift: null,
-    caseMode: 'CASE1',
+    caseMode: 'BOTH',
     modalRowId: null,
     initialFocusDone: false,
     refreshTimer: null,
@@ -198,9 +198,10 @@
         driverName: textValue(cell(row, ix.driverName)),
         sourceSheetRow: String(i + 1)
       };
-      // Only keep relevant operational types, before applying the Case 2 priority rule.
+      // Keep both eligible movement types in the same shift schedule.
       if (!L.isCase1(record) && !L.isCase2(record)) continue;
-      const eventTime = L.isCase2(record)
+      record.caseType = L.isCase2(record) ? 'CASE2' : 'CASE1';
+      const eventTime = record.caseType === 'CASE2'
         ? (L.toMinutes(record.actualArrival) !== null ? record.actualArrival : record.plannedArrival)
         : record.plannedPull;
       const eventIso = localIsoTime(record.sourceDate, eventTime);
@@ -475,6 +476,7 @@
         const event = new Date(row.eventTimeISO);
         return event >= state.activeShift.start && event < state.activeShift.end;
       });
+      // Keep every eligible UB11 and qualifying Intercity movement in this shift.
       const chosen = L.selectSchedule(scoped);
       const selected = chosen.rows;
       const existingValues = await readTab(cfg.destinationTabs.schedule, HEADERS.length);
@@ -486,10 +488,11 @@
         const id = sourceRow.id || L.makeStableId(sourceRow);
         const existing = existingMap.get(id) || {};
         const eventTime = new Date(sourceRow.eventTimeISO);
-        const calculatedHscMinutes = chosen.mode === 'CASE1' ? L.durationMinutes(sourceRow.actualArrivalHsc, sourceRow.plannedPull) : null;
+        const rowIsUb11 = sourceRow.caseType === 'CASE1';
+        const calculatedHscMinutes = rowIsUb11 ? L.durationMinutes(sourceRow.actualArrivalHsc, sourceRow.plannedPull) : null;
         let operationalStatus = existing.operationalStatus || 'Planned';
         let completedAt = existing.completedAt || '';
-        if (chosen.mode === 'CASE1' && L.toMinutes(sourceRow.actualPull) !== null) {
+        if (rowIsUb11 && L.toMinutes(sourceRow.actualPull) !== null) {
           operationalStatus = 'Completed';
           completedAt = completedAt || localIsoTime(sourceRow.sourceDate, sourceRow.actualPull) || eventTime.toISOString();
         } else if (textValue(existing.operationalStatus).toLowerCase() === 'completed') {
@@ -497,7 +500,7 @@
         } else if (textValue(existing.bay) && !completedAt) {
           operationalStatus = 'Docked';
         }
-        const hscMinutes = chosen.mode === 'CASE1' && operationalStatus === 'Completed'
+        const hscMinutes = rowIsUb11 && operationalStatus === 'Completed'
           ? (calculatedHscMinutes === null ? (existing.timeAtHSCMinutes ?? '') : calculatedHscMinutes)
           : '';
         return {
@@ -505,7 +508,7 @@
           ...sourceRow,
           id,
           shiftStartISO: startIso,
-          caseType: chosen.mode,
+          caseType: sourceRow.caseType,
           bay: existing.bay || '',
           operationalStatus,
           dockedAt: existing.dockedAt || '',
@@ -525,7 +528,7 @@
       await writeAllSchedule(state.allRows);
       if (isInitial) state.initialFocusDone = false;
       renderWarehouse();
-      toast(`Shift synced: ${upserts.length} transaction${upserts.length === 1 ? '' : 's'} · ${chosen.mode === 'CASE2' ? 'Case 2 Intercity' : 'Case 1 UB11'}.`, 'success');
+      toast(`Shift synced: ${upserts.length} movement${upserts.length === 1 ? '' : 's'} across the full shift.`, 'success');
     } catch (error) {
       console.error('Relay schedule sync failed:', error, error?.result || error?.body || 'No Google API response body was provided');
       const message = googleErrorForUser(error, 'syncing the source tracker and destination schedule');
@@ -549,7 +552,7 @@
         <h1>Build your shift schedule.</h1>
         <p>Sign in with the Google account that can edit the separate schedule workbook. The RHS tracker is read as the source of truth; bays, docked status, completion times and shift links are written to the destination workbook.</p>
         <div class="login-grid">
-          <div class="login-info"><span class="info-dot">↻</span><div><b>Live tracker sync</b><p>Reads the source schedule and chooses Case 2 only when all Intercity conditions are matched. Otherwise it uses Case 1.</p></div></div>
+          <div class="login-info"><span class="info-dot">↻</span><div><b>Live tracker sync</b><p>Loads all eligible UB11 and qualifying Intercity movements together for the selected shift.</p></div></div>
           <div class="login-info"><span class="info-dot">⌖</span><div><b>Yard marshall link</b><p>Generate a QR code and a shift-only link. The public view displays a rolling two-hour window and does not ask the marshall to sign in.</p></div></div>
         </div>
         ${isError && errorText ? `<div class="notice error"><strong>Connection issue:</strong> ${escapeHtml(errorText)}</div>` : ''}
@@ -572,22 +575,21 @@
     const completed = ordered.filter(isDone).length;
     const docked = ordered.filter(row => statusFor(row) === 'Docked').length;
     const outstanding = ordered.length - completed;
-    const modeTitle = state.caseMode === 'CASE2' ? 'Case 2 · Intercity to UB11' : 'Case 1 · UB11 schedule';
     root.innerHTML = `
       <div class="page-heading">
         <div><div class="eyebrow">Operations / Shift timeline</div><h1>Warehouse schedule</h1><p>Keep the active movement in view, assign a bay when a vehicle docks, and capture completion directly to the operational ledger.</p></div>
         <div class="heading-actions"><button class="btn" id="refresh-button">↻ Refresh tracker</button><button class="btn dark" id="logout-button">Sign out</button></div>
       </div>
       <div class="stats-grid">
-        <div class="stat-card"><div class="stat-top">Shift movements <span class="stat-icon">▦</span></div><div class="stat-value">${ordered.length}</div><div class="stat-caption">${escapeHtml(modeTitle)}</div></div>
+        <div class="stat-card"><div class="stat-top">Shift movements <span class="stat-icon">▦</span></div><div class="stat-value">${ordered.length}</div><div class="stat-caption">Full shift · all eligible movements</div></div>
         <div class="stat-card"><div class="stat-top">Completed <span class="stat-icon">✓</span></div><div class="stat-value">${completed}</div><div class="stat-caption">Including source actual pulls</div></div>
         <div class="stat-card"><div class="stat-top">Docked <span class="stat-icon">⌖</span></div><div class="stat-value">${docked}</div><div class="stat-caption">Bay assigned, not yet complete</div></div>
         <div class="stat-card"><div class="stat-top">Outstanding <span class="stat-icon">◷</span></div><div class="stat-value">${outstanding}</div><div class="stat-caption">Planned or currently docked</div></div>
       </div>
-      <div class="notice"><strong>${escapeHtml(shift.label)} · ${escapeHtml(fmtDate(shift.start, { weekday: 'long', day: '2-digit', month: 'short' }))}</strong> &nbsp; Current mode: ${escapeHtml(modeTitle)}. ${state.caseMode === 'CASE2' ? 'Case 2 is active because matching NG15/WS2 Intercity rows with UB11 in the postcode were found for this shift; Case 1 rows are suppressed for this shift.' : 'No qualifying Case 2 entries were found for this shift, so the UB11 Case 1 schedule is shown.'}</div>
+      <div class="notice"><strong>${escapeHtml(shift.label)} · ${escapeHtml(fmtDate(shift.start, { weekday: 'long', day: '2-digit', month: 'short' }))}</strong> &nbsp; Showing all eligible movements for the full shift, including UB11 movements and qualifying Intercity movements to UB11. Future movements remain in the timeline through shift end; completed movements are grouped above the outstanding schedule.</div>
       <section class="schedule-layout">
         <div class="schedule-toolbar">
-          <div class="toolbar-left"><div class="shift-icon">◷</div><div><div class="section-title">${escapeHtml(modeTitle)}</div><div class="section-subtitle">${escapeHtml(fmtDate(shift.start, { day: '2-digit', month: 'short' }))} ${fmtClock(shift.start)} to ${escapeHtml(fmtDate(shift.end, { day: '2-digit', month: 'short' }))} ${fmtClock(shift.end)} · Updated ${fmtClock(new Date())}</div></div></div>
+          <div class="toolbar-left"><div class="shift-icon">◷</div><div><div class="section-title">Shift timeline</div><div class="section-subtitle">${escapeHtml(fmtDate(shift.start, { day: '2-digit', month: 'short' }))} ${fmtClock(shift.start)} to ${escapeHtml(fmtDate(shift.end, { day: '2-digit', month: 'short' }))} ${fmtClock(shift.end)} · Updated ${fmtClock(new Date())}</div></div></div>
           <div class="toolbar-actions"><span class="subtle-label">${escapeHtml(shift.type)} SHIFT</span><button class="btn primary" id="generate-link-button">Create marshall link + QR</button></div>
         </div>
         ${ordered.length ? `<div class="schedule-list" id="schedule-list">${ordered.map((row, index) => renderScheduleCard(row, index, ordered)).join('')}</div>` : `<div class="empty-state"><div class="empty-icon">◷</div><h3>No matching movements in this shift</h3><p>The tracker synced successfully, but it has no eligible records within ${escapeHtml(shift.label)}. Try refreshing or check the source date and planned times.</p><button class="btn" id="empty-refresh">Refresh tracker</button></div>`}
@@ -625,7 +627,7 @@
     const status = statusFor(row);
     const done = status === 'Completed';
     const eventDate = scheduleEventDate(row);
-    const time = eventDate ? fmtClock(eventDate) : (state.caseMode === 'CASE2' ? fmtTime(row.actualArrival || row.plannedArrival) : fmtTime(row.plannedPull));
+    const time = eventDate ? fmtClock(eventDate) : (row.caseType === 'CASE2' ? fmtTime(row.actualArrival || row.plannedArrival) : fmtTime(row.plannedPull));
     const now = new Date();
     const pending = ordered.filter(item => !isDone(item));
     let targetActive = pending.find(item => {
@@ -641,12 +643,12 @@
     return `<article class="schedule-card ${done ? 'done-card' : ''} ${isActive ? 'active-card' : ''}" data-row-id="${escapeHtml(row.id)}" data-active="${isActive ? 'true' : 'false'}" tabindex="0" role="button" aria-label="Open ${escapeHtml(row.client || 'schedule record')}">
       <div class="card-main">
         <div class="time-column"><div class="event-time">${escapeHtml(time)}</div><div class="event-label">${done ? 'Completed' : (isActive ? 'Current focus' : 'Scheduled')}</div></div>
-        <div class="client-area"><div class="client-line"><span class="client-name">${escapeHtml(row.client || 'Unassigned client')}</span><span class="case-pill">${escapeHtml(row.caseType || state.caseMode)}</span><span class="status-pill ${status.toLowerCase()}">${escapeHtml(status)}</span></div>
+        <div class="client-area"><div class="client-line"><span class="client-name">${escapeHtml(row.client || 'Unassigned client')}</span><span class="status-pill ${status.toLowerCase()}">${escapeHtml(status)}</span></div>
           <div class="client-meta"><span><b>HSC</b> ${escapeHtml(row.hsc || '—')}</span><span><b>Load</b> ${escapeHtml(row.loadType || '—')}</span><span><b>Type</b> ${escapeHtml(row.vehicleType || '—')}</span></div>
         </div>
         <div class="card-right"><div class="plate"><span class="gb">GB</span><strong>${escapeHtml(row.reg || 'NO REG')}</strong></div><div class="bay-badge ${row.bay ? 'assigned' : ''}">${escapeHtml(row.bay || 'No bay')}</div><button type="button" class="open-card" data-row-id="${escapeHtml(row.id)}" aria-label="Open details">›</button></div>
       </div>
-      <div class="card-bottom"><div class="card-bottom-left"><span class="volume-chip"><i>▤</i> ${escapeHtml(palletText)} pallets</span><span class="volume-chip"><i>▧</i> ${escapeHtml(bagsText)} bags / loose parcels</span>${state.caseMode === 'CASE1' && done && row.timeAtHSCMinutes !== '' && row.timeAtHSCMinutes !== null && row.timeAtHSCMinutes !== undefined ? `<span class="volume-chip"><i>◷</i> Time at HSC <b>${escapeHtml(elapsedLabel(Number(row.timeAtHSCMinutes)))}</b></span>` : ''}${row.code ? `<span>Ref <b>${escapeHtml(row.code)}</b></span>` : ''}</div><div class="card-bottom-right">${isActive ? '<span class="card-badge-active">● Active focus</span>' : ''}<span>Tap to view details ↗</span></div></div>
+      <div class="card-bottom"><div class="card-bottom-left"><span class="volume-chip"><i>▤</i> ${escapeHtml(palletText)} pallets</span><span class="volume-chip"><i>▧</i> ${escapeHtml(bagsText)} bags / loose parcels</span>${row.caseType === 'CASE1' && done && row.timeAtHSCMinutes !== '' && row.timeAtHSCMinutes !== null && row.timeAtHSCMinutes !== undefined ? `<span class="volume-chip"><i>◷</i> Time at HSC <b>${escapeHtml(elapsedLabel(Number(row.timeAtHSCMinutes)))}</b></span>` : ''}${row.code ? `<span>Ref <b>${escapeHtml(row.code)}</b></span>` : ''}</div><div class="card-bottom-right">${isActive ? '<span class="card-badge-active">● Active focus</span>' : ''}<span>Tap to view details ↗</span></div></div>
     </article>`;
   }
 
@@ -655,7 +657,7 @@
     if (!row) return;
     state.modalRowId = id;
     const status = statusFor(row);
-    const elapsed = state.caseMode === 'CASE1' && row.timeAtHSCMinutes !== '' && row.timeAtHSCMinutes !== null && row.timeAtHSCMinutes !== undefined
+    const elapsed = row.caseType === 'CASE1' && row.timeAtHSCMinutes !== '' && row.timeAtHSCMinutes !== null && row.timeAtHSCMinutes !== undefined
       ? `${row.timeAtHSCMinutes < 0 ? '−' : ''}${Math.floor(Math.abs(Number(row.timeAtHSCMinutes)) / 60)}h ${String(Math.abs(Number(row.timeAtHSCMinutes)) % 60).padStart(2, '0')}m`
       : 'Not available';
     const field = (label, value) => `<div class="detail-item"><small>${escapeHtml(label)}</small><strong>${escapeHtml(value || '—')}</strong></div>`;
@@ -672,7 +674,7 @@
           ${field('Planned pull', fmtTime(row.plannedPull))}${field('Actual pull', fmtTime(row.actualPull))}
           ${field('ETA to HSC', fmtTime(row.etaToHsc))}${field('Actual arrival at HSC', fmtTime(row.actualArrivalHsc))}
           ${field('Pallets', row.pallets)}${field('Bags / loose parcels', row.bagsLooseParcels)}
-          ${field('Time at HSC (Case 1 only)', elapsed)}${field('Last synced', row.syncedAt ? fmtDate(row.syncedAt, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—')}
+          ${field('Time at HSC', row.caseType === 'CASE1' ? elapsed : 'Not applicable for this movement')}${field('Last synced', row.syncedAt ? fmtDate(row.syncedAt, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—')}
           ${field('Docked at', row.dockedAt ? fmtDate(row.dockedAt, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—')}${field('Completed at', row.completedAt ? fmtDate(row.completedAt, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : (L.toMinutes(row.actualPull) !== null ? fmtTime(row.actualPull) : '—'))}
         </div>
         <div class="form-row"><div class="field"><label for="bay-select">Assign a bay</label><select id="bay-select">${bayOptions}</select></div><div class="field"><label>Operational status</label><input readonly value="${escapeHtml(status)}" aria-label="Operational status"></div></div>
@@ -712,7 +714,8 @@
     if (!row) return;
     const now = isoNow();
     const updated = { ...row, operationalStatus: 'Completed', completedAt: row.completedAt || now, syncedAt: now };
-    if (state.caseMode === 'CASE1') updated.timeAtHSCMinutes = L.durationMinutes(row.actualArrivalHsc, row.plannedPull) ?? '';
+    if (row.caseType === 'CASE1') updated.timeAtHSCMinutes = L.durationMinutes(row.actualArrivalHsc, row.plannedPull) ?? '';
+    else updated.timeAtHSCMinutes = ''; 
     try {
       await replaceScheduleRecord(updated, 'MARKED_COMPLETED', `Manually marked completed at ${fmtDate(now, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' })}`);
       closeModal();
@@ -885,7 +888,7 @@
         const event = scheduleEventDate(row);
         return event && event >= now && event <= until && !isDone(row);
       }).sort((a, b) => scheduleEventDate(a) - scheduleEventDate(b));
-      state.caseMode = state.shiftRows[0]?.caseType || schedule[0]?.caseType || 'CASE1';
+      state.caseMode = 'BOTH';
       renderYard(schedule);
       window.clearInterval(state.refreshTimer);
       state.refreshTimer = setInterval(() => renderYardView().catch(error => console.error(error)), cfg.refreshIntervalMs);
@@ -911,7 +914,7 @@
     const dt = scheduleEventDate(row);
     const status = statusFor(row);
     const time = dt ? fmtClock(dt) : '—';
-    return `<article class="schedule-card"><div class="card-main"><div class="time-column"><div class="event-time">${escapeHtml(time)}</div><div class="event-label">${escapeHtml(row.caseType || 'Schedule')}</div></div><div class="client-area"><div class="client-line"><span class="client-name">${escapeHtml(row.client || 'Unassigned client')}</span><span class="status-pill ${status.toLowerCase()}">${escapeHtml(status)}</span></div><div class="client-meta"><span><b>HSC</b> ${escapeHtml(row.hsc || '—')}</span><span><b>Type</b> ${escapeHtml(row.vehicleType || '—')}</span><span><b>Load</b> ${escapeHtml(row.loadType || '—')}</span></div></div><div class="card-right"><div class="plate"><span class="gb">GB</span><strong>${escapeHtml(row.reg || 'NO REG')}</strong></div><div class="bay-badge ${row.bay ? 'assigned' : ''}">${escapeHtml(row.bay || 'No bay')}</div></div></div><div class="card-bottom"><div class="card-bottom-left"><span class="volume-chip"><i>▤</i> ${escapeHtml(row.pallets || '—')} pallets</span><span class="volume-chip"><i>▧</i> ${escapeHtml(row.bagsLooseParcels || '—')} bags / loose parcels</span></div><div class="card-bottom-right"><span>${escapeHtml(row.code || '')}</span></div></div></article>`;
+    return `<article class="schedule-card"><div class="card-main"><div class="time-column"><div class="event-time">${escapeHtml(time)}</div><div class="event-label">Scheduled movement</div></div><div class="client-area"><div class="client-line"><span class="client-name">${escapeHtml(row.client || 'Unassigned client')}</span><span class="status-pill ${status.toLowerCase()}">${escapeHtml(status)}</span></div><div class="client-meta"><span><b>HSC</b> ${escapeHtml(row.hsc || '—')}</span><span><b>Type</b> ${escapeHtml(row.vehicleType || '—')}</span><span><b>Load</b> ${escapeHtml(row.loadType || '—')}</span></div></div><div class="card-right"><div class="plate"><span class="gb">GB</span><strong>${escapeHtml(row.reg || 'NO REG')}</strong></div><div class="bay-badge ${row.bay ? 'assigned' : ''}">${escapeHtml(row.bay || 'No bay')}</div></div></div><div class="card-bottom"><div class="card-bottom-left"><span class="volume-chip"><i>▤</i> ${escapeHtml(row.pallets || '—')} pallets</span><span class="volume-chip"><i>▧</i> ${escapeHtml(row.bagsLooseParcels || '—')} bags / loose parcels</span></div><div class="card-bottom-right"><span>${escapeHtml(row.code || '')}</span></div></div></article>`;
   }
 
   function navigate(view) {

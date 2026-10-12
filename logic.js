@@ -82,7 +82,10 @@
   }
 
   function eventMinutes(row, mode) {
-    if (mode === 'CASE2') return toMinutes(row.actualArrival) ?? toMinutes(row.plannedArrival);
+    const rowType = String(row.caseType || '').toUpperCase();
+    if (rowType === 'CASE2' || (!rowType && isCase2(row)) || (rowType !== 'CASE1' && mode === 'CASE2')) {
+      return toMinutes(row.actualArrival) ?? toMinutes(row.plannedArrival);
+    }
     return toMinutes(row.plannedPull);
   }
 
@@ -92,7 +95,6 @@
   }
 
   function sortSchedule(rows, mode, now = new Date()) {
-    const currentMinutes = now.getHours() * 60 + now.getMinutes();
     return [...rows].sort((a, b) => {
       const doneA = isCompleted(a) ? 1 : 0;
       const doneB = isCompleted(b) ? 1 : 0;
@@ -100,9 +102,6 @@
       const dateAForDone = a.eventTimeISO ? new Date(a.eventTimeISO).getTime() : NaN;
       const dateBForDone = b.eventTimeISO ? new Date(b.eventTimeISO).getTime() : NaN;
       if (doneA && doneB && Number.isFinite(dateAForDone) && Number.isFinite(dateBForDone) && dateAForDone !== dateBForDone) return dateAForDone - dateBForDone;
-      const dockA = normalizeText(a.operationalStatus).toLowerCase() === 'docked' ? 1 : 0;
-      const dockB = normalizeText(b.operationalStatus).toLowerCase() === 'docked' ? 1 : 0;
-      if (dockA !== dockB) return dockB - dockA;
       const dateA = a.eventTimeISO ? new Date(a.eventTimeISO).getTime() : NaN;
       const dateB = b.eventTimeISO ? new Date(b.eventTimeISO).getTime() : NaN;
       if (Number.isFinite(dateA) && Number.isFinite(dateB)) {
@@ -119,14 +118,22 @@
         if (mb === null && ma !== null) return -1;
         if (ma !== null && mb !== null && ma !== mb) return ma - mb;
       }
+      // Keep docked records visually prominent only when their schedule times tie.
+      const dockA = normalizeText(a.operationalStatus).toLowerCase() === 'docked' ? 1 : 0;
+      const dockB = normalizeText(b.operationalStatus).toLowerCase() === 'docked' ? 1 : 0;
+      if (dockA !== dockB) return dockB - dockA;
       return normalizeText(a.client).localeCompare(normalizeText(b.client));
     });
   }
 
   function selectSchedule(rows) {
-    const mode = chooseScheduleMode(rows);
-    const selected = rows.filter(mode === 'CASE2' ? isCase2 : isCase1);
-    return { mode, rows: selected };
+    // Both movement rules are shown together. The rule classifies each row only;
+    // the presence of an Intercity movement must never suppress UB11 movements.
+    const selected = rows.filter(row => isCase1(row) || isCase2(row)).map(row => ({
+      ...row,
+      caseType: isCase2(row) ? 'CASE2' : 'CASE1'
+    }));
+    return { mode: 'BOTH', rows: selected };
   }
 
   function classifySourceRows(rows) {
