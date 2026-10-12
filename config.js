@@ -7,7 +7,7 @@ window.APP_CONFIG = {
   sourceSpreadsheetId: '1WqGcIzuL2l3BL_okzDf-nNqKrAmYKG5v_ZpeVBsH3xk',
   sourceSheetGid: 1760538646,
   // The source gid is resolved to a tab title through the Sheets API after sign-in.
-  destinationSpreadsheetId: '1ME1GP76QH14NvRIbLbHYh3Zj9DuNHejcIOY0IOY2nzg',
+  destinationSpreadsheetId: '1pxRKd4ceIgUwNThG1sfy4HCoAfkkhh9rgBsMyVPcxFg',
   destinationTabs: {
     schedule: 'Schedule',
     links: 'ShiftLinks',
