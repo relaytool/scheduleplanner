@@ -73,3 +73,16 @@
   font-size: 0.9rem;
   font-weight: 600;
 }
+
+/* Interactive shift/date selector for reviewing saved and historical movements. */
+.shift-picker{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 0 18px;padding:15px 17px;border:1px solid var(--line);border-radius:15px;background:#fff;box-shadow:0 3px 12px #24355304}
+.shift-picker-title{display:flex;align-items:center;gap:10px;white-space:nowrap;color:#22304a}
+.shift-picker-title strong{font:800 13px Manrope,sans-serif}
+.shift-picker-icon{width:34px;height:34px;display:grid;place-items:center;border-radius:10px;background:var(--blue-soft);color:var(--blue);font-size:18px}
+.shift-picker-controls{display:flex;align-items:flex-end;gap:9px;flex-wrap:wrap}
+.shift-picker-controls .field{min-width:150px;display:flex;flex-direction:column;gap:5px}
+.shift-picker-controls label{font-size:10px;font-weight:800;color:#657188}
+.shift-picker-controls input,.shift-picker-controls select{height:39px;width:100%;padding:0 10px;border:1px solid #dce3ee;border-radius:10px;background:#fff;color:var(--ink);min-width:0}
+.shift-picker-controls .btn{height:39px;white-space:nowrap}
+@media(max-width:760px){.shift-picker{display:block}.shift-picker-title{margin-bottom:13px}.shift-picker-controls{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:end}.shift-picker-controls .field{min-width:0}.shift-picker-controls .btn{width:100%}}
+@media(max-width:420px){.shift-picker-controls{grid-template-columns:minmax(0,1fr)}.shift-picker-controls .btn{width:100%}}

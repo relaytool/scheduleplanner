@@ -19,6 +19,8 @@
     auditRowCount: 1,
     sourceTabTitle: null,
     allRows: [],
+    parsedSourceRows: [],
+    viewedShiftStartISO: null,
     manualRows: loadManualRows(),
     persistedScheduleRowCount: 1,
     shiftRows: [],
@@ -531,14 +533,106 @@
     });
     state.auditRowCount += 1;
   }
+  function displayedShift() {
+    return (state.viewedShiftStartISO && shiftFromStartIso(state.viewedShiftStartISO)) || state.activeShift || activeShift();
+  }
+  function isHistoricalView() {
+    return displayedShift().start.toISOString() !== activeShift().start.toISOString();
+  }
   function setCurrentRowsFromAll() {
-    if (!state.activeShift) return;
-    const startIso = state.activeShift.start.toISOString();
+    const shift = displayedShift();
+    if (!shift) return;
+    const startIso = shift.start.toISOString();
     const sourceRows = state.allRows.filter(row => row.shiftStartISO === startIso);
     const selected = L.selectSchedule(sourceRows);
     state.caseMode = 'BOTH';
-    // Locally added movements stay in this browser and are never written to Google Sheets.
-    state.shiftRows = [...selected.rows, ...manualRowsForShift(state.activeShift)];
+    // Local-only entries stay in this browser and are never written to Google Sheets.
+    state.shiftRows = [...selected.rows, ...manualRowsForShift(shift)];
+  }
+  function parsedRowsForShift(parsedRows, shift) {
+    const dateKeys = [dateKey(shift.start), dateKey(new Date(shift.end.getTime() - 1))];
+    return parsedRows.filter(row => {
+      if (row.eventTimeISO) {
+        const event = new Date(row.eventTimeISO);
+        return !Number.isNaN(event.getTime()) && event >= shift.start && event < shift.end;
+      }
+      return row.caseType === 'CASE3' && dateKeys.includes(row.sourceDate);
+    });
+  }
+  function buildRowsForShift(sourceRows, shift, existingRows = state.allRows) {
+    const startIso = shift.start.toISOString();
+    const existingMap = new Map(existingRows.map(row => [row.id, row]));
+    const syncedAt = isoNow();
+    return L.selectSchedule(sourceRows).rows.map(sourceRow => {
+      const id = sourceRow.id || L.makeStableId(sourceRow);
+      const existing = existingMap.get(id) || {};
+      const mergedSource = {
+        ...sourceRow,
+        actualArrivalHsc: sourceRow.actualArrivalHsc || existing.actualArrivalHsc || '',
+        actualArrival: sourceRow.actualArrival || (sourceRow.actualArrivalHasNonTimeText ? '' : (existing.actualArrival || '')),
+        actualPull: sourceRow.actualPull || existing.actualPull || ''
+      };
+      const type = sourceRow.caseType;
+      const rowIsCase2 = type === 'CASE2';
+      const rowIsCase3 = type === 'CASE3';
+      const sourceCompletionTime = (type === 'CASE1' || rowIsCase3) ? mergedSource.actualPull : '';
+      const existingStatus = textValue(existing.operationalStatus).toLowerCase();
+      const sourceStatus = textValue(mergedSource.sourceStatus).toLowerCase();
+      const case1IntercityComplete = type === 'CASE1' && textValue(mergedSource.loadType).toUpperCase().includes('INTERCITY') && ['complete', 'completed', 'done', 'dispatched'].includes(sourceStatus);
+      const autoDispatched = L.toMinutes(sourceCompletionTime) !== null || case1IntercityComplete;
+      const calculatedHscMinutes = rowIsCase2 ? L.timeAtHSCMinutes(mergedSource) : null;
+      let operationalStatus = 'Planned';
+      let completedAt = existing.completedAt || '';
+      if (rowIsCase2) {
+        operationalStatus = L.toMinutes(mergedSource.actualArrivalHsc) !== null || existingStatus === 'arrived'
+          ? 'Arrived' : (textValue(existing.bay) ? 'Docked' : 'Planned');
+        completedAt = '';
+      } else if (autoDispatched || ['dispatched', 'completed', 'complete', 'done'].includes(existingStatus)) {
+        operationalStatus = 'Dispatched';
+        const referenceTime = type === 'CASE1' ? (mergedSource.etaToHsc || mergedSource.plannedArrival) : (mergedSource.actualArrival || mergedSource.plannedArrival);
+        completedAt = completedAt || localIsoRelativeToEvent(mergedSource.sourceDate, sourceCompletionTime || mergedSource.actualPull, referenceTime) || mergedSource.eventTimeISO || syncedAt;
+      } else if ((type === 'CASE1' && L.toMinutes(mergedSource.actualArrivalHsc) !== null) || (rowIsCase3 && L.toMinutes(mergedSource.actualArrival) !== null)) {
+        operationalStatus = 'Arrived'; completedAt = '';
+      } else if (textValue(existing.bay)) { operationalStatus = 'Docked'; completedAt = ''; }
+      else { completedAt = ''; }
+      const hscMinutes = rowIsCase2 ? (calculatedHscMinutes === null ? (existing.timeAtHSCMinutes ?? '') : calculatedHscMinutes) : '';
+      return {
+        ...existing, ...mergedSource, id, shiftStartISO: startIso, caseType: type,
+        bay: existing.bay || '', operationalStatus, dockedAt: existing.dockedAt || '', completedAt,
+        timeAtHSCMinutes: hscMinutes === null ? '' : hscMinutes, syncedAt
+      };
+    });
+  }
+  async function viewSelectedShift() {
+    const dateValue = $('#shift-date-picker')?.value;
+    const period = $('#shift-period-picker')?.value || 'DAY';
+    if (!dateValue || !/^\d{4}-\d{2}-\d{2}$/.test(dateValue)) return toast('Choose a valid shift date.', 'error');
+    const [year, month, day] = dateValue.split('-').map(Number);
+    const start = new Date(year, month - 1, day, period === 'NIGHT' ? cfg.dayShiftEndHour : cfg.shiftStartHour, 0, 0, 0);
+    const shift = shiftFromStartIso(start.toISOString());
+    if (!shift) return toast('Choose a valid shift.', 'error');
+    const current = activeShift();
+    if (shift.start > current.start) return toast('That shift has not started yet.', 'error');
+    state.viewedShiftStartISO = shift.start.toISOString() === current.start.toISOString() ? null : shift.start.toISOString();
+    if (state.parsedSourceRows.length) {
+      const sourceRows = parsedRowsForShift(state.parsedSourceRows, shift);
+      const built = buildRowsForShift(sourceRows, shift, state.allRows);
+      const merged = new Map(state.allRows.map(row => [row.id, row]));
+      built.forEach(row => merged.set(row.id, row));
+      state.allRows = [...merged.values()];
+    }
+    setCurrentRowsFromAll();
+    state.initialFocusDone = false;
+    renderWarehouse();
+    if (state.accessToken && state.parsedSourceRows.length && isHistoricalView()) {
+      try {
+        await writeAllSchedule(state.allRows);
+        toast('Shift loaded.', 'success');
+      } catch (error) {
+        console.error('Could not save the selected historical shift:', error);
+        toast('The historical shift is visible, but could not be saved to the schedule.', 'error', 7000);
+      }
+    }
   }
   async function refreshWarehouse(isInitial = false) {
     if (!state.accessToken) { renderLogin(); return; }
@@ -547,91 +641,32 @@
       if (!state.tabsReady) await ensureDestinationTabs();
       const now = new Date();
       state.activeShift = activeShift(now);
-      const startIso = state.activeShift.start.toISOString();
       const sourceValues = await getSourceValues();
       const parsed = parseSourceRows(sourceValues);
-      const shiftDateKeys = [dateKey(state.activeShift.start), dateKey(new Date(state.activeShift.end.getTime() - 1))];
-      const scoped = parsed.filter(row => {
-        if (row.eventTimeISO) {
-          const event = new Date(row.eventTimeISO);
-          return !Number.isNaN(event.getTime()) && event >= state.activeShift.start && event < state.activeShift.end;
-        }
-        return row.caseType === 'CASE3' && shiftDateKeys.includes(row.sourceDate);
-      });
-      // Include all eligible movement types; unscheduled Returns remain at the bottom.
-      const chosen = L.selectSchedule(scoped);
-      const selected = chosen.rows;
+      state.parsedSourceRows = parsed;
+      const scoped = parsedRowsForShift(parsed, state.activeShift);
+      // Include all eligible movements; Returns without an arrival remain at the bottom.
       const existingValues = await readTab(cfg.destinationTabs.schedule, HEADERS.length);
       const existingRows = getObjectRows(existingValues);
       state.persistedScheduleRowCount = existingValues.length || 1;
-      const existingMap = new Map(existingRows.map(row => [row.id, row]));
-      const syncedAt = isoNow();
-      const upserts = selected.map(sourceRow => {
-        const id = sourceRow.id || L.makeStableId(sourceRow);
-        const existing = existingMap.get(id) || {};
-        // Preserve an operator-entered arrival/pull time until the source tracker supplies its own value.
-        const mergedSource = {
-          ...sourceRow,
-          actualArrivalHsc: sourceRow.actualArrivalHsc || existing.actualArrivalHsc || '',
-          actualArrival: sourceRow.actualArrival || (sourceRow.actualArrivalHasNonTimeText ? '' : (existing.actualArrival || '')),
-          actualPull: sourceRow.actualPull || existing.actualPull || ''
-        };
-        const type = sourceRow.caseType;
-        const rowIsCase2 = type === 'CASE2';
-        const rowIsCase3 = type === 'CASE3';
-        const sourceCompletionTime = (type === 'CASE1' || rowIsCase3) ? mergedSource.actualPull : '';
-        const existingStatus = textValue(existing.operationalStatus).toLowerCase();
-        const sourceStatus = textValue(mergedSource.sourceStatus).toLowerCase();
-        const case1IntercityComplete = type === 'CASE1' && textValue(mergedSource.loadType).toUpperCase().includes('INTERCITY') && ['complete', 'completed', 'done', 'dispatched'].includes(sourceStatus);
-        const autoDispatched = L.toMinutes(sourceCompletionTime) !== null || case1IntercityComplete;
-        const calculatedHscMinutes = rowIsCase2 ? L.timeAtHSCMinutes(mergedSource) : null;
-        let operationalStatus = 'Planned';
-        let completedAt = existing.completedAt || '';
-
-        if (rowIsCase2) {
-          // This movement uses arrival at HSC as its operational milestone.
-          operationalStatus = L.toMinutes(mergedSource.actualArrivalHsc) !== null || existingStatus === 'arrived'
-            ? 'Arrived'
-            : (textValue(existing.bay) ? 'Docked' : 'Planned');
-          completedAt = '';
-        } else if (autoDispatched || ['dispatched', 'completed', 'complete', 'done'].includes(existingStatus)) {
-          operationalStatus = 'Dispatched';
-          const referenceTime = type === 'CASE1' ? (mergedSource.etaToHsc || mergedSource.plannedArrival) : (mergedSource.actualArrival || mergedSource.plannedArrival);
-          completedAt = completedAt || localIsoRelativeToEvent(mergedSource.sourceDate, sourceCompletionTime || mergedSource.actualPull, referenceTime) || mergedSource.eventTimeISO || syncedAt;
-        } else if ((type === 'CASE1' && L.toMinutes(mergedSource.actualArrivalHsc) !== null) || (rowIsCase3 && L.toMinutes(mergedSource.actualArrival) !== null)) {
-          operationalStatus = 'Arrived';
-          completedAt = '';
-        } else if (textValue(existing.bay)) {
-          operationalStatus = 'Docked';
-          completedAt = '';
-        } else {
-          completedAt = '';
-        }
-        const hscMinutes = rowIsCase2
-          ? (calculatedHscMinutes === null ? (existing.timeAtHSCMinutes ?? '') : calculatedHscMinutes)
-          : '';
-        return {
-          ...existing,
-          ...mergedSource,
-          id,
-          shiftStartISO: startIso,
-          caseType: type,
-          bay: existing.bay || '',
-          operationalStatus,
-          dockedAt: existing.dockedAt || '',
-          completedAt,
-          timeAtHSCMinutes: hscMinutes === null ? '' : hscMinutes,
-          syncedAt
-        };
-      });
+      const upserts = buildRowsForShift(scoped, state.activeShift, existingRows);
+      const startIso = state.activeShift.start.toISOString();
       // Keep prior records from other shifts; replace only matching IDs for this shift.
       const upsertMap = new Map(upserts.map(row => [row.id, row]));
       const merged = existingRows.filter(row => row.shiftStartISO !== startIso && !upsertMap.has(row.id));
       merged.push(...upserts);
       state.allRows = merged;
       state.activeShift = activeShift(now);
-      state.shiftRows = [...upserts, ...manualRowsForShift(state.activeShift)];
-      state.caseMode = 'BOTH';
+      // If the operator is browsing a past shift, also hydrate that selection from the full source tracker.
+      // The source remains untouched; the operational copy is retained in the destination workbook.
+      const selectedShift = displayedShift();
+      if (selectedShift.start.toISOString() !== state.activeShift.start.toISOString()) {
+        const historicalUpserts = buildRowsForShift(parsedRowsForShift(parsed, selectedShift), selectedShift, state.allRows);
+        const historicalMap = new Map(state.allRows.map(row => [row.id, row]));
+        historicalUpserts.forEach(row => historicalMap.set(row.id, row));
+        state.allRows = [...historicalMap.values()];
+      }
+      setCurrentRowsFromAll();
       await writeAllSchedule(state.allRows);
       if (isInitial) state.initialFocusDone = false;
       renderWarehouse();
@@ -670,7 +705,8 @@
   function renderWarehouse() {
     $('#main-nav').classList.remove('hidden');
     $$('.nav-tab').forEach(button => button.classList.toggle('active', button.dataset.view === 'warehouse'));
-    const shift = state.activeShift || activeShift();
+    const shift = displayedShift();
+    const historical = isHistoricalView();
     const currentRows = state.shiftRows || [];
     const ordered = L.sortSchedule(currentRows, state.caseMode, new Date());
     const dispatched = ordered.filter(row => statusFor(row) === 'Dispatched').length;
@@ -679,7 +715,7 @@
     root.innerHTML = `
       <div class="page-heading">
         <div><div class="eyebrow">RELAY OPERATIONS</div><h1>Warehouse schedule</h1></div>
-        <div class="heading-actions"><button class="btn" id="refresh-button">↻ Refresh tracker</button><button class="btn" id="add-schedule-button">＋ Add schedule</button><button class="btn dark" id="logout-button">Sign out</button></div>
+        <div class="heading-actions"><button class="btn" id="refresh-button">↻ Refresh tracker</button><button class="btn" id="add-schedule-button" ${historical ? 'disabled' : ''}>＋ Add schedule</button><button class="btn dark" id="logout-button">Sign out</button></div>
       </div>
       <div class="stats-grid">
         <div class="stat-card"><div class="stat-top">Shift movements <span class="stat-icon">▦</span></div><div class="stat-value">${ordered.length}</div></div>
@@ -687,16 +723,30 @@
         <div class="stat-card"><div class="stat-top">Docked <span class="stat-icon">⌖</span></div><div class="stat-value">${docked}</div></div>
         <div class="stat-card"><div class="stat-top">Outstanding <span class="stat-icon">◷</span></div><div class="stat-value">${outstanding}</div></div>
       </div>
-      <div class="shift-date-strip">${escapeHtml(shift.label)} · ${escapeHtml(fmtDate(shift.start, { weekday: 'long', day: '2-digit', month: 'short' }))}</div>
+      <div class="shift-date-strip">${escapeHtml(shift.label)} · ${escapeHtml(fmtDate(shift.start, { weekday: 'long', day: '2-digit', month: 'short', year: 'numeric' }))}${historical ? ' · History' : ''}</div>
+      <section class="shift-picker" aria-label="Choose a shift"><div class="shift-picker-title"><span class="shift-picker-icon">◷</span><strong>View deliveries</strong></div><div class="shift-picker-controls"><div class="field"><label for="shift-date-picker">Shift date</label><input id="shift-date-picker" type="date" max="${dateKey(new Date())}" value="${dateKey(shift.start)}"></div><div class="field"><label for="shift-period-picker">Shift time</label><select id="shift-period-picker"><option value="DAY" ${shift.type === 'DAY' ? 'selected' : ''}>07:00–19:00</option><option value="NIGHT" ${shift.type === 'NIGHT' ? 'selected' : ''}>19:00–07:00</option></select></div><button type="button" class="btn primary" id="view-shift-button">View shift</button><button type="button" class="btn" id="current-shift-button" ${historical ? '' : 'disabled'}>Current shift</button></div></section>
       <section class="schedule-layout">
         <div class="schedule-toolbar">
           <div class="toolbar-left"><div class="shift-icon">◷</div><div><div class="section-title">Shift timeline</div><div class="section-subtitle">${escapeHtml(fmtDate(shift.start, { day: '2-digit', month: 'short' }))} ${fmtClock(shift.start)} to ${escapeHtml(fmtDate(shift.end, { day: '2-digit', month: 'short' }))} ${fmtClock(shift.end)} · Updated ${fmtClock(new Date())}</div></div></div>
-          <div class="toolbar-actions"><span class="subtle-label">${escapeHtml(shift.type)} SHIFT</span><button class="btn" id="shift-report-button">Generate shift report</button><button class="btn primary" id="generate-link-button">Create marshall link + QR</button></div>
+          <div class="toolbar-actions"><span class="subtle-label">${escapeHtml(shift.type)} SHIFT</span><button class="btn" id="shift-report-button">Generate shift report</button><button class="btn primary" id="generate-link-button" ${historical ? 'disabled' : ''}>Create marshall link + QR</button></div>
         </div>
         ${ordered.length ? `<div class="schedule-list" id="schedule-list">${ordered.map((row, index) => renderScheduleCard(row, index, ordered)).join('')}</div>` : `<div class="empty-state"><div class="empty-icon">◷</div><h3>No movements scheduled</h3><button class="btn" id="empty-refresh">Refresh</button></div>`}
       </section>
       <section id="yard-link-panel" class="link-panel hidden"><div class="link-panel-head"><div><h2>Yard marshall access</h2></div><button class="btn" id="close-link-panel">Close</button></div><div class="link-result"><div><div class="link-url"><input id="yard-link-input" readonly aria-label="Temporary yard marshall link"><button class="btn primary" id="copy-yard-link">Copy link</button></div><p id="link-expiry-text" class="section-subtitle"></p></div><div id="yard-qr" class="qr-box"><span class="section-subtitle">QR will appear here</span></div></div></section>`;
     $('#refresh-button')?.addEventListener('click', () => refreshWarehouse(false));
+    $('#view-shift-button')?.addEventListener('click', viewSelectedShift);
+    $('#current-shift-button')?.addEventListener('click', () => {
+      state.viewedShiftStartISO = null;
+      state.shiftRows = [];
+      if (state.parsedSourceRows.length) {
+        const current = activeShift();
+        const built = buildRowsForShift(parsedRowsForShift(state.parsedSourceRows, current), current, state.allRows);
+        const merged = new Map(state.allRows.map(row => [row.id, row]));
+        built.forEach(row => merged.set(row.id, row));
+        state.allRows = [...merged.values()];
+      }
+      setCurrentRowsFromAll(); renderWarehouse();
+    });
     $('#empty-refresh')?.addEventListener('click', () => refreshWarehouse(false));
     $('#logout-button')?.addEventListener('click', signOut);
     $('#add-schedule-button')?.addEventListener('click', openAddScheduleModal);
@@ -769,9 +819,9 @@
       : (eventDate ? fmtClock(eventDate) : fmtTime(L.scheduledTime(row)));
     const now = new Date();
     const pending = ordered.filter(item => !isDone(item));
-    let targetActive = pending.find(item => { const dt = scheduleEventDate(item); return dt && dt.getTime() <= now.getTime(); })
-      || pending.find(item => { const dt = scheduleEventDate(item); return dt && dt.getTime() >= now.getTime(); }) || pending[0];
-    const isActive = !done && targetActive?.id === row.id;
+    let targetActive = isHistoricalView() ? null : (pending.find(item => { const dt = scheduleEventDate(item); return dt && dt.getTime() <= now.getTime(); })
+      || pending.find(item => { const dt = scheduleEventDate(item); return dt && dt.getTime() >= now.getTime(); }) || pending[0]);
+    const isActive = !isHistoricalView() && !done && targetActive?.id === row.id;
     const bagsText = row.bagsLooseParcels ? row.bagsLooseParcels : '—';
     const palletText = row.pallets ? row.pallets : '—';
     const elapsed = type === 'CASE2' ? elapsedForRow(row) : '';
@@ -795,6 +845,7 @@
     state.modalRowId = id;
     const type = L.movementType(row);
     const status = statusFor(row);
+    const historical = isHistoricalView();
     const elapsed = type === 'CASE2' ? (elapsedForRow(row) || '—') : '—';
     const field = (label, value) => `<div class="detail-item"><small>${escapeHtml(label)}</small><strong>${escapeHtml(value || '—')}</strong></div>`;
     const bayOptions = ['<option value="">No bay assigned</option>', ...cfg.bayOptions.map(bay => `<option value="${escapeHtml(bay)}" ${row.bay === bay ? 'selected' : ''}>${escapeHtml(bay)}</option>`), ...(row.bay && !cfg.bayOptions.includes(row.bay) ? [`<option selected value="${escapeHtml(row.bay)}">${escapeHtml(row.bay)}</option>`] : [])].join('');
@@ -821,8 +872,8 @@
           ${field('Time at HSC', elapsed)}${field('Source', isLocalManual(row) ? 'Local' : 'Tracker')}
           ${field('Docked at', row.dockedAt ? fmtDate(row.dockedAt, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—')}${field(milestoneLabel, milestoneValue)}
         </div>
-        <div class="form-row"><div class="field"><label for="bay-select">Assign a bay</label><select id="bay-select">${bayOptions}</select></div><div class="field"><label>Operational status</label><input readonly value="${escapeHtml(status)}" aria-label="Operational status"></div></div>
-        <div class="modal-footer"><button class="btn danger" id="modal-cancel">Close</button><div class="right-actions"><button class="btn" id="save-bay">Save bay</button><button class="btn primary" id="mark-complete" ${actionDisabled ? 'disabled' : ''}>✓ ${actionLabel}</button></div></div>
+        <div class="form-row"><div class="field"><label for="bay-select">Assigned bay</label><select id="bay-select" ${historical ? 'disabled' : ''}>${bayOptions}</select></div><div class="field"><label>Operational status</label><input readonly value="${escapeHtml(status)}" aria-label="Operational status"></div></div>
+        <div class="modal-footer"><button class="btn danger" id="modal-cancel">Close</button><div class="right-actions"><button class="btn" id="save-bay" ${historical ? 'disabled' : ''}>Save bay</button><button class="btn primary" id="mark-complete" ${actionDisabled || historical ? 'disabled' : ''}>✓ ${actionLabel}</button></div></div>
       </div></section>`;
     document.body.appendChild(modal);
     $('#close-modal', modal).addEventListener('click', closeModal);
@@ -851,6 +902,7 @@
     renderWarehouse();
   }
   async function saveBay(id, bay) {
+    if (isHistoricalView()) return toast('Historical shifts are read-only.', 'error');
     const row = state.shiftRows.find(item => item.id === id);
     if (!row) return;
     const now = isoNow();
@@ -865,6 +917,7 @@
   }
 
   async function completeRow(id) {
+    if (isHistoricalView()) return toast('Historical shifts are read-only.', 'error');
     const row = state.shiftRows.find(item => item.id === id);
     if (!row) return;
     const now = new Date();
@@ -994,7 +1047,7 @@
     return { start, end, type: isNight ? 'NIGHT' : 'DAY', label: isNight ? '19:00–07:00' : '07:00–19:00' };
   }
   function knownShifts() {
-    const starts = new Set([state.activeShift?.start.toISOString(), ...state.allRows.map(row => row.shiftStartISO), ...state.manualRows.map(row => row.shiftStartISO)].filter(Boolean));
+    const starts = new Set([state.activeShift?.start.toISOString(), state.viewedShiftStartISO, ...state.allRows.map(row => row.shiftStartISO), ...state.manualRows.map(row => row.shiftStartISO)].filter(Boolean));
     return [...starts].map(shiftFromStartIso).filter(Boolean).sort((a, b) => b.start - a.start);
   }
   function rowsForShift(shift) {
@@ -1043,7 +1096,7 @@
   }
   function selectedReportShift() {
     const select = $('#report-shift-select');
-    return shiftFromStartIso(select?.value || state.activeShift.start.toISOString()) || state.activeShift;
+    return shiftFromStartIso(select?.value || displayedShift().start.toISOString()) || displayedShift();
   }
   function openShiftReport() {
     const shifts = knownShifts();
@@ -1052,7 +1105,7 @@
     const modal = document.createElement('div');
     modal.className = 'modal-backdrop report-modal-backdrop';
     modal.id = 'shift-report-modal';
-    modal.innerHTML = `<section class="modal wide-modal report-modal" role="dialog" aria-modal="true" aria-labelledby="report-title"><header class="modal-header"><div><div class="eyebrow">Operations summary</div><h2 id="report-title">Shift report</h2><p>Review the full movement list, then print to PDF or download the report as CSV.</p></div><button class="modal-close" id="report-close" aria-label="Close">×</button></header><div class="modal-body"><div class="report-controls"><div class="field"><label for="report-shift-select">Select shift</label><select id="report-shift-select">${shifts.map(shift => `<option value="${escapeHtml(shift.start.toISOString())}" ${shift.start.toISOString() === state.activeShift.start.toISOString() ? 'selected' : ''}>${escapeHtml(shift.label)} · ${escapeHtml(fmtDate(shift.start, { day: '2-digit', month: 'short', year: 'numeric' }))}</option>`).join('')}</select></div><div class="report-actions"><button id="report-download-csv" class="btn">Download CSV</button><button id="report-print" class="btn primary">Print / Save PDF</button></div></div><div id="report-content"></div></div></section>`;
+    modal.innerHTML = `<section class="modal wide-modal report-modal" role="dialog" aria-modal="true" aria-labelledby="report-title"><header class="modal-header"><div><div class="eyebrow">Operations summary</div><h2 id="report-title">Shift report</h2><p>Review the full movement list, then print to PDF or download the report as CSV.</p></div><button class="modal-close" id="report-close" aria-label="Close">×</button></header><div class="modal-body"><div class="report-controls"><div class="field"><label for="report-shift-select">Select shift</label><select id="report-shift-select">${shifts.map(shift => `<option value="${escapeHtml(shift.start.toISOString())}" ${shift.start.toISOString() === displayedShift().start.toISOString() ? 'selected' : ''}>${escapeHtml(shift.label)} · ${escapeHtml(fmtDate(shift.start, { day: '2-digit', month: 'short', year: 'numeric' }))}</option>`).join('')}</select></div><div class="report-actions"><button id="report-download-csv" class="btn">Download CSV</button><button id="report-print" class="btn primary">Print / Save PDF</button></div></div><div id="report-content"></div></div></section>`;
     document.body.appendChild(modal);
     const content = $('#report-content', modal);
     renderReportContent(content, selectedReportShift());
@@ -1096,6 +1149,7 @@
   }
   async function generateYardLink() {
     try {
+      if (isHistoricalView()) throw new Error('Switch to the current shift to create a Marshall link.');
       if (!state.accessToken) throw new Error('Sign in again to create a temporary link.');
       const shift = state.activeShift || activeShift();
       const values = await readTab(cfg.destinationTabs.links, LINK_HEADERS.length);
@@ -1228,25 +1282,52 @@
       const shiftEnd = new Date(validLink[shiftEndIdx]);
       const now = new Date();
       if (Number.isNaN(shiftEnd.getTime()) || now < shiftStart || now >= shiftEnd) throw new Error('Link expired.');
-      const sh = (scheduleValues[0] || []).map(L.normalizedHeader);
-      const index = name => sh.indexOf(L.normalizedHeader(name));
+      const rawHeader = scheduleValues[0] || [];
+      const sh = rawHeader.map(L.normalizedHeader);
+      // Headers from the public Google Visualization export can be transformed or omitted on older tabs.
+      // Prefer named columns, then fall back to this app's stable Schedule layout positions.
+      const publicHeaderOrder = HEADERS.map(L.normalizedHeader);
+      const index = name => {
+        const normalized = L.normalizedHeader(name);
+        const aliases = {
+          SourceDate: ['source date'], ShiftStartISO: ['shift start iso'],
+          EventTimeISO: ['event time iso'], CaseType: ['case type'],
+          ActualArrivalHSC: ['actual arrival hsc'], BagsLooseParcels: ['bags loose parcels']
+        };
+        const aliasList = aliases[name] || [];
+        let found = sh.findIndex(value => value === normalized || aliasList.includes(value));
+        if (found >= 0) return found;
+        const canonicalName = ({ sourceDate: 'SourceDate', shiftStartISO: 'ShiftStartISO', eventTimeISO: 'EventTimeISO', caseType: 'CaseType', actualArrivalHSC: 'ActualArrivalHSC', bagsLooseParcels: 'BagsLooseParcels' })[name] || name;
+        const fallback = publicHeaderOrder.indexOf(L.normalizedHeader(canonicalName));
+        return fallback >= 0 ? fallback : -1;
+      };
       const idx = {
         id: index('ID'), sourceDate: index('SourceDate'), client: index('Client'), broker: index('Broker'), hsc: index('HSC'), loadType: index('LoadType'), code: index('Code'), postcode: index('Postcode'), vehicleType: index('VehicleType'),
         plannedArrival: index('PlannedArrival'), actualArrival: index('ActualArrival'), plannedPull: index('PlannedPull'), actualPull: index('ActualPull'), etaToHsc: index('ETAToHSC'),
         actualArrivalHsc: index('ActualArrivalHSC'), pallets: index('Pallets'), bags: index('BagsLooseParcels'), reg: index('Reg'), driver: index('DriverName'), shiftStart: index('ShiftStartISO'),
         eventIso: index('EventTimeISO'), status: index('OperationalStatus'), bay: index('Bay'), completeAt: index('CompletedAt'), caseType: index('CaseType'), timeAtHSC: index('TimeAtHSCMinutes')
       };
-      if (idx.id < 0 || idx.shiftStart < 0 || idx.bay < 0 || idx.caseType < 0 || idx.eventIso < 0) {
-        throw new Error('Schedule unavailable. Ask the warehouse operator to sync the schedule and create a fresh link.');
+      if (!scheduleValues.length || idx.id < 0 || idx.shiftStart < 0 || idx.bay < 0) {
+        console.error('Marshall Schedule tab schema not recognised', { headers: rawHeader, resolved: idx });
+        throw new Error('The schedule is temporarily unavailable. Ask the warehouse operator to refresh the page.');
       }
+      const valueAt = (row, key) => idx[key] >= 0 ? textValue(row[idx[key]]) : '';
       const activeShiftStartMs = shiftStart.getTime();
-      const schedule = scheduleValues.slice(1).map(row => ({
-        id: textValue(row[idx.id]), sourceDate: textValue(row[idx.sourceDate]), client: textValue(row[idx.client]), broker: textValue(row[idx.broker]), hsc: textValue(row[idx.hsc]), loadType: textValue(row[idx.loadType]), code: textValue(row[idx.code]), postcode: textValue(row[idx.postcode]),
-        vehicleType: textValue(row[idx.vehicleType]), plannedArrival: textValue(row[idx.plannedArrival]), actualArrival: textValue(row[idx.actualArrival]), plannedPull: textValue(row[idx.plannedPull]), actualPull: textValue(row[idx.actualPull]),
-        etaToHsc: textValue(row[idx.etaToHsc]), actualArrivalHsc: textValue(row[idx.actualArrivalHsc]), pallets: textValue(row[idx.pallets]), bagsLooseParcels: textValue(row[idx.bags]), reg: textValue(row[idx.reg]), driverName: textValue(row[idx.driver]),
-        shiftStartISO: textValue(row[idx.shiftStart]), eventTimeISO: textValue(row[idx.eventIso]), operationalStatus: textValue(row[idx.status]), bay: textValue(row[idx.bay]), completedAt: textValue(row[idx.completeAt]), caseType: textValue(row[idx.caseType]),
-        timeAtHSCMinutes: row[idx.timeAtHSC] === '' || row[idx.timeAtHSC] == null ? '' : Number(row[idx.timeAtHSC])
-      })).filter(row => {
+      const schedule = scheduleValues.slice(1).map(row => {
+        const mapped = {
+          id: valueAt(row, 'id'), sourceDate: valueAt(row, 'sourceDate'), client: valueAt(row, 'client'), broker: valueAt(row, 'broker'), hsc: valueAt(row, 'hsc'), loadType: valueAt(row, 'loadType'), code: valueAt(row, 'code'), postcode: valueAt(row, 'postcode'),
+          vehicleType: valueAt(row, 'vehicleType'), plannedArrival: valueAt(row, 'plannedArrival'), actualArrival: valueAt(row, 'actualArrival'), plannedPull: valueAt(row, 'plannedPull'), actualPull: valueAt(row, 'actualPull'),
+          etaToHsc: valueAt(row, 'etaToHsc'), actualArrivalHsc: valueAt(row, 'actualArrivalHsc'), pallets: valueAt(row, 'pallets'), bagsLooseParcels: valueAt(row, 'bags'), reg: valueAt(row, 'reg'), driverName: valueAt(row, 'driver'),
+          shiftStartISO: valueAt(row, 'shiftStart'), eventTimeISO: valueAt(row, 'eventIso'), operationalStatus: valueAt(row, 'status'), bay: valueAt(row, 'bay'), completedAt: valueAt(row, 'completeAt'), caseType: valueAt(row, 'caseType'),
+          timeAtHSCMinutes: valueAt(row, 'timeAtHSC') === '' ? '' : Number(valueAt(row, 'timeAtHSC'))
+        };
+        if (!mapped.caseType) mapped.caseType = L.movementType(mapped);
+        if (!mapped.eventTimeISO && mapped.sourceDate) {
+          const eventClock = L.scheduledTime(mapped);
+          mapped.eventTimeISO = localIsoTime(mapped.sourceDate, eventClock) || '';
+        }
+        return mapped;
+      }).filter(row => {
         const rowShiftStart = new Date(row.shiftStartISO).getTime();
         return Boolean(row.id && row.bay && Number.isFinite(rowShiftStart) && rowShiftStart === activeShiftStartMs);
       });
