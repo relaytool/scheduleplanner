@@ -59,3 +59,17 @@
 
 /* Keep Marshall completion action visible on narrow/mobile screens. */
 .yard-card-actions{display:flex!important;align-items:center;gap:10px;flex-wrap:wrap}.yard-complete-button{padding:8px 10px;font-size:11px;white-space:nowrap}
+
+/* Compact shift heading for the clean operator interface. */
+.shift-date-strip {
+  display: flex;
+  align-items: center;
+  padding: 10px 14px;
+  margin: 12px 0 18px;
+  border: 1px solid var(--line, #e2e8f0);
+  border-radius: 12px;
+  background: #fff;
+  color: var(--muted, #64748b);
+  font-size: 0.9rem;
+  font-weight: 600;
+}

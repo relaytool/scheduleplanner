@@ -11,6 +11,8 @@
     }
     const s = normalizeText(value);
     if (!s || /^(?:---|n\/a|na|none|null|nothing to collect|closed for today|cancelled!?|tbc)$/i.test(s)) return null;
+    // The tracker sometimes writes values such as "ETA 17:00" into Actual Arrival. That is a note, not an actual timestamp.
+    if (/^(?:eta|estimated|expected|planned|approx(?:imately)?)\b/i.test(s)) return null;
     const match = s.match(/(?:^|\b)(\d{1,2}):(\d{2})(?::\d{2})?(?:\b|$)/);
     if (!match) return null;
     const h = Number(match[1]), m = Number(match[2]);

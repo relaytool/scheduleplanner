@@ -64,7 +64,7 @@
     persistYardCompletedIds();
     state.shiftRows = (state.shiftRows || []).filter(row => row.id !== id);
     renderYard(state.shiftRows);
-    toast('Hidden from this Marshall device. The shared warehouse ledger is unchanged because this link is read-only.', 'success', 6500);
+    toast('Movement marked complete.', 'success');
   }
   function persistManualRows() {
     try { localStorage.setItem(MANUAL_STORAGE_KEY, JSON.stringify(state.manualRows)); }
@@ -142,9 +142,20 @@
     return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
   }
   function timeString(value) {
-    const n = L.toMinutes(value);
-    if (n === null) return textValue(value);
-    return `${String(Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}`;
+    if (typeof value === 'number') {
+      const n = L.toMinutes(value);
+      return n === null ? '' : `${String(Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}`;
+    }
+    const raw = textValue(value);
+    if (!raw || /^(?:[-–—]+|n\/?a|na|null|none|tbc|cancelled!?|nothing to collect)$/i.test(raw)) return '';
+    // This source has free text such as "ETA 17:00" and Returns item names in the time columns.
+    // Treat only a bare clock value as a time; never turn that text into an actual arrival.
+    if (/^(?:eta|estimated|expected|planned|approx(?:imately)?)\b/i.test(raw)) return '';
+    const match = raw.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+    if (!match) return '';
+    const hours = Number(match[1]), minutes = Number(match[2]);
+    if (hours > 23 || minutes > 59) return '';
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
   }
   function dateCellToKey(value) {
     if (typeof value === 'number' && value > 20000 && value < 80000) {
@@ -238,6 +249,7 @@
     if (ix.hsc < 0 || ix.loadType < 0 || ix.plannedPull < 0) throw new Error('The source header row is missing one or more required columns: HSC, LOAD TYPE, Planned Pull.');
     let currentDate = null;
     const all = [];
+    const seenStableIds = new Set();
     for (let i = headerRowIndex + 1; i < values.length; i++) {
       const row = values[i] || [];
       const first = cell(row, 0);
@@ -248,11 +260,15 @@
       const hsc = textValue(cell(row, ix.hsc));
       const loadType = textValue(cell(row, ix.loadType));
       if (!hsc) continue;
+      const actualArrivalRaw = textValue(cell(row, ix.actualArrival));
+      const actualArrivalParsed = timeString(cell(row, ix.actualArrival));
+      const actualArrivalHasNonTimeText = Boolean(actualArrivalRaw && !actualArrivalParsed && !/^(?:[-–—]+|n\/?a|na|null|none|tbc|cancelled!?|nothing to collect)$/i.test(actualArrivalRaw));
       const record = {
         sourceDate: currentDate || dateCellToKey(cell(row, ix.sourceDate)) || '', hsc, loadType,
         code: textValue(cell(row, ix.code)), client: textValue(cell(row, ix.client)), broker: textValue(cell(row, ix.broker)),
         postcode: textValue(cell(row, ix.postcode)), vehicleType: textValue(cell(row, ix.vehicleType)),
-        plannedArrival: timeString(cell(row, ix.plannedArrival)), actualArrival: timeString(cell(row, ix.actualArrival)),
+        plannedArrival: timeString(cell(row, ix.plannedArrival)), actualArrival: actualArrivalParsed,
+        actualArrivalRaw, actualArrivalHasNonTimeText,
         plannedPull: timeString(cell(row, ix.plannedPull)), actualPull: timeString(cell(row, ix.actualPull)),
         etaToHsc: timeString(cell(row, ix.etaToHsc)), actualArrivalHsc: timeString(cell(row, ix.actualArrivalHsc)),
         pallets: textValue(cell(row, ix.pallets)), bagsLooseParcels: textValue(cell(row, ix.bagsLooseParcels)),
@@ -263,11 +279,13 @@
       record.caseType = L.isCase2(record) ? 'CASE2' : (L.isCase3(record) ? 'CASE3' : 'CASE1');
       const eventTime = L.scheduledTime(record);
       const eventIso = localIsoTime(record.sourceDate, eventTime);
-      // Keep Returns even when Actual Arrival (I) is missing. They are sorted at the bottom
+      // Keep Returns even when an actual arrival is missing. They are sorted at the bottom
       // until an actual arrival time appears; a planned time is retained for shift scoping.
       record.eventTimeISO = eventIso || '';
       record.eventTimeLocal = eventTime ? `${fmtDate(eventIso || record.sourceDate, { day: '2-digit', month: 'short' })} ${fmtTime(eventTime)}` : 'Arrival time not entered';
-      record.id = L.makeStableId(record);
+      const stableId = L.makeStableId(record);
+      record.id = seenStableIds.has(stableId) ? `${stableId}|ROW:${record.sourceSheetRow}` : stableId;
+      seenStableIds.add(record.id);
       all.push(record);
     }
     return all;
@@ -540,7 +558,7 @@
         }
         return row.caseType === 'CASE3' && shiftDateKeys.includes(row.sourceDate);
       });
-      // Keep Case 1 and Case 2 movements together; Returns are Case 3 and remain at the bottom.
+      // Include all eligible movement types; unscheduled Returns remain at the bottom.
       const chosen = L.selectSchedule(scoped);
       const selected = chosen.rows;
       const existingValues = await readTab(cfg.destinationTabs.schedule, HEADERS.length);
@@ -555,6 +573,7 @@
         const mergedSource = {
           ...sourceRow,
           actualArrivalHsc: sourceRow.actualArrivalHsc || existing.actualArrivalHsc || '',
+          actualArrival: sourceRow.actualArrival || (sourceRow.actualArrivalHasNonTimeText ? '' : (existing.actualArrival || '')),
           actualPull: sourceRow.actualPull || existing.actualPull || ''
         };
         const type = sourceRow.caseType;
@@ -570,7 +589,7 @@
         let completedAt = existing.completedAt || '';
 
         if (rowIsCase2) {
-          // Arrival to HSC is the operational milestone for Case 2, not Completed/Dispatched.
+          // This movement uses arrival at HSC as its operational milestone.
           operationalStatus = L.toMinutes(mergedSource.actualArrivalHsc) !== null || existingStatus === 'arrived'
             ? 'Arrived'
             : (textValue(existing.bay) ? 'Docked' : 'Planned');
@@ -616,7 +635,7 @@
       await writeAllSchedule(state.allRows);
       if (isInitial) state.initialFocusDone = false;
       renderWarehouse();
-      toast(`Shift synced: ${upserts.length} movement${upserts.length === 1 ? '' : 's'} across the full shift.`, 'success');
+      toast('Schedule updated.', 'success');
     } catch (error) {
       console.error('Relay schedule sync failed:', error, error?.result || error?.body || 'No Google API response body was provided');
       const message = googleErrorForUser(error, 'syncing the source tracker and destination schedule');
@@ -636,20 +655,14 @@
     root.innerHTML = `
       <section class="login-panel">
         <div class="login-symbol">▦</div>
-        <div class="eyebrow">Warehouse control desk</div>
-        <h1>Build your shift schedule.</h1>
-        <p>Sign in with the Google account that can edit the separate schedule workbook. The RHS tracker is read as the source of truth; bays, docked status, completion times and shift links are written to the destination workbook.</p>
-        <div class="login-grid">
-          <div class="login-info"><span class="info-dot">↻</span><div><b>Live tracker sync</b><p>Loads UB11 movements, Intercity movements for client UB11, and Returns at HSC UB11.</p></div></div>
-          <div class="login-info"><span class="info-dot">⌖</span><div><b>Yard marshall link</b><p>Generate a QR code and a shift-only link. The public view displays a rolling two-hour window and does not ask the marshall to sign in.</p></div></div>
-        </div>
-        ${isError && errorText ? `<div class="notice error"><strong>Connection issue:</strong> ${escapeHtml(errorText)}</div>` : ''}
-        ${missingClient ? `<div class="notice warning"><strong>One-time setup required.</strong> Add your Google OAuth Client ID in <code>config.js</code>, enable the Google Sheets API, and add your hosted site as an authorised JavaScript origin. The included SETUP.md walks through it.</div>` : ''}
+        <div class="eyebrow">RELAY</div>
+        <h1>Sign in</h1>
+        ${isError && errorText ? `<div class="notice error">${escapeHtml(errorText)}</div>` : ''}
+        ${missingClient ? `<div class="notice warning">Setup incomplete.</div>` : ''}
         <div class="form-row">
-          <div class="field"><label for="operator-name">Operator name (for the audit log)</label><input id="operator-name" value="${escapeHtml(state.operatorName)}" placeholder="Warehouse operator" autocomplete="name"></div>
+          <div class="field"><label for="operator-name">Operator</label><input id="operator-name" value="${escapeHtml(state.operatorName)}" placeholder="Name" autocomplete="name"></div>
         </div>
         <button id="sign-in-button" class="btn primary" ${missingClient ? 'disabled' : ''}>Continue with Google <span>↗</span></button>
-        <p class="section-subtitle" style="margin-top:15px">Your Google permission is used to update the destination spreadsheet. No Apps Script or server is required.</p>
       </section>`;
     $('#sign-in-button')?.addEventListener('click', signIn);
   }
@@ -665,24 +678,24 @@
     const outstanding = ordered.length - dispatched;
     root.innerHTML = `
       <div class="page-heading">
-        <div><div class="eyebrow">Operations / Shift timeline</div><h1>Warehouse schedule</h1><p>Keep the shift timeline in view, assign bays, and record arrival or dispatch milestones to the operational ledger.</p></div>
+        <div><div class="eyebrow">RELAY OPERATIONS</div><h1>Warehouse schedule</h1></div>
         <div class="heading-actions"><button class="btn" id="refresh-button">↻ Refresh tracker</button><button class="btn" id="add-schedule-button">＋ Add schedule</button><button class="btn dark" id="logout-button">Sign out</button></div>
       </div>
       <div class="stats-grid">
-        <div class="stat-card"><div class="stat-top">Shift movements <span class="stat-icon">▦</span></div><div class="stat-value">${ordered.length}</div><div class="stat-caption">Full shift · all eligible movements</div></div>
-        <div class="stat-card"><div class="stat-top">Dispatched <span class="stat-icon">✓</span></div><div class="stat-value">${dispatched}</div><div class="stat-caption">Actual Pull recorded or manually dispatched</div></div>
-        <div class="stat-card"><div class="stat-top">Docked <span class="stat-icon">⌖</span></div><div class="stat-value">${docked}</div><div class="stat-caption">Bay assigned, not yet complete</div></div>
-        <div class="stat-card"><div class="stat-top">Outstanding <span class="stat-icon">◷</span></div><div class="stat-value">${outstanding}</div><div class="stat-caption">Planned or currently docked</div></div>
+        <div class="stat-card"><div class="stat-top">Shift movements <span class="stat-icon">▦</span></div><div class="stat-value">${ordered.length}</div></div>
+        <div class="stat-card"><div class="stat-top">Dispatched <span class="stat-icon">✓</span></div><div class="stat-value">${dispatched}</div></div>
+        <div class="stat-card"><div class="stat-top">Docked <span class="stat-icon">⌖</span></div><div class="stat-value">${docked}</div></div>
+        <div class="stat-card"><div class="stat-top">Outstanding <span class="stat-icon">◷</span></div><div class="stat-value">${outstanding}</div></div>
       </div>
-      <div class="notice"><strong>${escapeHtml(shift.label)} · ${escapeHtml(fmtDate(shift.start, { weekday: 'long', day: '2-digit', month: 'short' }))}</strong> &nbsp; Showing all eligible movements for the full shift. Intercity movements require Client UB11 at NG15/WS2; Returns at HSC UB11 are listed after the other movements. Returns without an Actual Arrival time appear at the bottom of the Returns group.</div>
+      <div class="shift-date-strip">${escapeHtml(shift.label)} · ${escapeHtml(fmtDate(shift.start, { weekday: 'long', day: '2-digit', month: 'short' }))}</div>
       <section class="schedule-layout">
         <div class="schedule-toolbar">
           <div class="toolbar-left"><div class="shift-icon">◷</div><div><div class="section-title">Shift timeline</div><div class="section-subtitle">${escapeHtml(fmtDate(shift.start, { day: '2-digit', month: 'short' }))} ${fmtClock(shift.start)} to ${escapeHtml(fmtDate(shift.end, { day: '2-digit', month: 'short' }))} ${fmtClock(shift.end)} · Updated ${fmtClock(new Date())}</div></div></div>
           <div class="toolbar-actions"><span class="subtle-label">${escapeHtml(shift.type)} SHIFT</span><button class="btn" id="shift-report-button">Generate shift report</button><button class="btn primary" id="generate-link-button">Create marshall link + QR</button></div>
         </div>
-        ${ordered.length ? `<div class="schedule-list" id="schedule-list">${ordered.map((row, index) => renderScheduleCard(row, index, ordered)).join('')}</div>` : `<div class="empty-state"><div class="empty-icon">◷</div><h3>No matching movements in this shift</h3><p>The tracker synced successfully, but it has no eligible records within ${escapeHtml(shift.label)}. Try refreshing or check the source date and planned times.</p><button class="btn" id="empty-refresh">Refresh tracker</button></div>`}
+        ${ordered.length ? `<div class="schedule-list" id="schedule-list">${ordered.map((row, index) => renderScheduleCard(row, index, ordered)).join('')}</div>` : `<div class="empty-state"><div class="empty-icon">◷</div><h3>No movements scheduled</h3><button class="btn" id="empty-refresh">Refresh</button></div>`}
       </section>
-      <section id="yard-link-panel" class="link-panel hidden"><div class="link-panel-head"><div><h2>Yard marshall access</h2><p>The link expires at shift end. The marshall sees only bay-assigned vehicles, with case-specific arrival and departure expiry rules.</p></div><button class="btn" id="close-link-panel">Close</button></div><div class="link-result"><div><div class="link-url"><input id="yard-link-input" readonly aria-label="Temporary yard marshall link"><button class="btn primary" id="copy-yard-link">Copy link</button></div><p id="link-expiry-text" class="section-subtitle"></p></div><div id="yard-qr" class="qr-box"><span class="section-subtitle">QR will appear here</span></div></div></section>`;
+      <section id="yard-link-panel" class="link-panel hidden"><div class="link-panel-head"><div><h2>Yard marshall access</h2></div><button class="btn" id="close-link-panel">Close</button></div><div class="link-result"><div><div class="link-url"><input id="yard-link-input" readonly aria-label="Temporary yard marshall link"><button class="btn primary" id="copy-yard-link">Copy link</button></div><p id="link-expiry-text" class="section-subtitle"></p></div><div id="yard-qr" class="qr-box"><span class="section-subtitle">QR will appear here</span></div></div></section>`;
     $('#refresh-button')?.addEventListener('click', () => refreshWarehouse(false));
     $('#empty-refresh')?.addEventListener('click', () => refreshWarehouse(false));
     $('#logout-button')?.addEventListener('click', signOut);
@@ -731,7 +744,7 @@
   }
   function renderedActualAtHsc(row) {
     const type = L.movementType(row);
-    if ((type === 'CASE1' || type === 'CASE2') && L.toMinutes(row.actualArrivalHsc) !== null) return `Actual HSC ${fmtTime(row.actualArrivalHsc)}`;
+    if ((type === 'CASE1' || type === 'CASE2') && L.toMinutes(row.actualArrivalHsc) !== null) return `Actual arrival at HSC ${fmtTime(row.actualArrivalHsc)}`;
     return '';
   }
 
@@ -763,16 +776,16 @@
     const palletText = row.pallets ? row.pallets : '—';
     const elapsed = type === 'CASE2' ? elapsedForRow(row) : '';
     const actualHsc = renderedActualAtHsc(row);
-    const eventLabel = type === 'CASE2' ? (status === 'Arrived' ? 'Actual arrival time HSC' : 'ETA to HSC') : (type === 'CASE3' && L.toMinutes(row.actualArrival) === null ? 'Arrival time pending' : (done ? 'Dispatched' : (status === 'Arrived' ? 'Arrived at HSC' : (isActive ? 'Current focus' : 'Scheduled'))));
+    const eventLabel = type === 'CASE2' ? 'ETA to HSC' : (type === 'CASE3' && L.toMinutes(row.actualArrival) === null ? 'Arrival time pending' : (done ? 'Dispatched' : (status === 'Arrived' ? 'Arrived at HSC' : (isActive ? 'Current focus' : 'Scheduled'))));
     return `<article class="schedule-card ${done ? 'done-card' : ''} ${isActive ? 'active-card' : ''}" data-row-id="${escapeHtml(row.id)}" data-active="${isActive ? 'true' : 'false'}" tabindex="0" role="button" aria-label="Open ${escapeHtml(row.client || 'schedule record')}">
       <div class="card-main">
         <div class="time-column"><div class="event-time">${escapeHtml(time)}</div><div class="event-label">${escapeHtml(eventLabel)}</div>${actualHsc ? `<div class="actual-time-note">${escapeHtml(actualHsc)}</div>` : ''}</div>
-        <div class="client-area"><div class="client-line"><span class="client-name">${escapeHtml(row.client || 'Unassigned client')}</span><span class="load-type-tag">${escapeHtml(row.loadType || 'Load type not set')}</span>${vehicleIconHtml(row)}<span class="status-pill ${status.toLowerCase()}">${escapeHtml(status)}</span>${isLocalManual(row) ? '<span class="local-only-tag">LOCAL ONLY</span>' : ''}</div>
-          <div class="client-meta"><span><b>HSC</b> ${escapeHtml(row.hsc || '—')}</span><span><b>Broker</b> ${escapeHtml(row.broker || '—')}</span><span><b>Driver</b> ${escapeHtml(row.driverName || '—')}</span><span><b>Route</b> ${escapeHtml(routeLabel(row))}</span><span><b>Planned H / Actual I</b> ${escapeHtml(fmtTime(row.plannedArrival))} / ${escapeHtml(fmtTime(row.actualArrival))}</span><span><b>ETA / Actual HSC</b> ${escapeHtml(fmtTime(row.etaToHsc))} / ${escapeHtml(fmtTime(row.actualArrivalHsc))}</span></div>
+        <div class="client-area"><div class="client-line"><span class="client-name">${escapeHtml(row.client || 'Unassigned client')}</span><span class="load-type-tag">${escapeHtml(row.loadType || 'Load type not set')}</span>${vehicleIconHtml(row)}<span class="status-pill ${status.toLowerCase()}">${escapeHtml(status)}</span>${isLocalManual(row) ? '<span class="local-only-tag">LOCAL</span>' : ''}</div>
+          <div class="client-meta"><span><b>HSC</b> ${escapeHtml(row.hsc || '—')}</span><span><b>Broker</b> ${escapeHtml(row.broker || '—')}</span><span><b>Driver</b> ${escapeHtml(row.driverName || '—')}</span><span><b>Route</b> ${escapeHtml(routeLabel(row))}</span><span><b>Planned / actual arrival</b> ${escapeHtml(fmtTime(row.plannedArrival))} / ${escapeHtml(fmtTime(row.actualArrival))}</span><span><b>ETA / actual arrival at HSC</b> ${escapeHtml(fmtTime(row.etaToHsc))} / ${escapeHtml(fmtTime(row.actualArrivalHsc))}</span></div>
         </div>
         <div class="card-right"><div class="plate"><span class="gb">GB</span><strong>${escapeHtml(row.reg || 'NO REG')}</strong></div><div class="bay-badge ${row.bay ? 'assigned' : ''}">${escapeHtml(row.bay || 'No bay')}</div><button type="button" class="open-card" data-row-id="${escapeHtml(row.id)}" aria-label="Open details">›</button></div>
       </div>
-      <div class="card-bottom"><div class="card-bottom-left"><span class="volume-chip"><i>▤</i> ${escapeHtml(palletText)} pallets</span><span class="volume-chip"><i>▧</i> ${escapeHtml(bagsText)} bags / loose parcels</span>${elapsed ? `<span class="volume-chip"><i>◷</i> Time at HSC <b>${escapeHtml(elapsed)}</b></span>` : ''}${row.code ? `<span>Ref <b>${escapeHtml(row.code)}</b></span>` : ''}${isLocalManual(row) ? '<span>Saved on this device only</span>' : ''}</div><div class="card-bottom-right">${isActive ? '<span class="card-badge-active">● Active focus</span>' : ''}<span>Tap to view details ↗</span></div></div>
+      <div class="card-bottom"><div class="card-bottom-left"><span class="volume-chip"><i>▤</i> ${escapeHtml(palletText)} pallets</span><span class="volume-chip"><i>▧</i> ${escapeHtml(bagsText)} bags / loose parcels</span>${elapsed ? `<span class="volume-chip"><i>◷</i> Time at HSC <b>${escapeHtml(elapsed)}</b></span>` : ''}${row.code ? `<span>Ref <b>${escapeHtml(row.code)}</b></span>` : ''}${isLocalManual(row) ? '<span>Local</span>' : ''}</div><div class="card-bottom-right">${isActive ? '<span class="card-badge-active">● Active focus</span>' : ''}</div></div>
     </article>`;
   }
 
@@ -782,7 +795,7 @@
     state.modalRowId = id;
     const type = L.movementType(row);
     const status = statusFor(row);
-    const elapsed = type === 'CASE2' ? (elapsedForRow(row) || 'Available when Actual Arrival (I) and Actual Pull (K) are both present') : 'Not calculated for this movement';
+    const elapsed = type === 'CASE2' ? (elapsedForRow(row) || '—') : '—';
     const field = (label, value) => `<div class="detail-item"><small>${escapeHtml(label)}</small><strong>${escapeHtml(value || '—')}</strong></div>`;
     const bayOptions = ['<option value="">No bay assigned</option>', ...cfg.bayOptions.map(bay => `<option value="${escapeHtml(bay)}" ${row.bay === bay ? 'selected' : ''}>${escapeHtml(bay)}</option>`), ...(row.bay && !cfg.bayOptions.includes(row.bay) ? [`<option selected value="${escapeHtml(row.bay)}">${escapeHtml(row.bay)}</option>`] : [])].join('');
     const isArrivalAction = type === 'CASE2';
@@ -796,16 +809,16 @@
     modal.className = 'modal-backdrop';
     modal.id = 'schedule-modal-backdrop';
     modal.innerHTML = `<section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
-      <header class="modal-header"><div><div class="eyebrow">Transaction details · ${escapeHtml(row.code || 'No reference')}</div><h2 id="modal-title">${escapeHtml(row.client || 'Unassigned client')}</h2><p>${escapeHtml(row.hsc)} · <span class="load-type-tag">${escapeHtml(row.loadType || 'Load type not set')}</span> · <span class="status-pill ${status.toLowerCase()}">${escapeHtml(status)}</span>${isLocalManual(row) ? ' · <span class="local-only-tag">LOCAL ONLY</span>' : ''}</p></div><button class="modal-close" id="close-modal" aria-label="Close">×</button></header>
+      <header class="modal-header"><div><div class="eyebrow">Transaction details · ${escapeHtml(row.code || 'No reference')}</div><h2 id="modal-title">${escapeHtml(row.client || 'Unassigned client')}</h2><p>${escapeHtml(row.hsc)} · <span class="load-type-tag">${escapeHtml(row.loadType || 'Load type not set')}</span> · <span class="status-pill ${status.toLowerCase()}">${escapeHtml(status)}</span>${isLocalManual(row) ? ' · <span class="local-only-tag">LOCAL</span>' : ''}</p></div><button class="modal-close" id="close-modal" aria-label="Close">×</button></header>
       <div class="modal-body">
         <div class="detail-grid">
           ${field('Vehicle registration', row.reg)}${field('Vehicle type', row.vehicleType)}${field('Driver', row.driverName)}${field('Broker', row.broker)}
           ${field('Route / postcode', routeLabel(row))}${field('Load type', row.loadType)}
-          ${field('Planned arrival (H)', fmtTime(row.plannedArrival))}${field('Actual arrival (I)', fmtTime(row.actualArrival))}
-          ${field('Planned pull (J)', fmtTime(row.plannedPull))}${field('Actual pull (K)', fmtTime(row.actualPull))}
-          ${field('ETA to HSC (L)', fmtTime(row.etaToHsc))}${field('Actual arrival time HSC (M)', fmtTime(row.actualArrivalHsc))}
+          ${field('Planned arrival', fmtTime(row.plannedArrival))}${field('Actual arrival', fmtTime(row.actualArrival))}
+          ${field('Planned pull', fmtTime(row.plannedPull))}${field('Actual pull', fmtTime(row.actualPull))}
+          ${field('ETA to HSC', fmtTime(row.etaToHsc))}${field('Actual arrival at HSC', fmtTime(row.actualArrivalHsc))}
           ${field('Pallets', row.pallets)}${field('Bags / loose parcels', row.bagsLooseParcels)}
-          ${field('Time at HSC', elapsed)}${field('Record source', isLocalManual(row) ? 'This device only' : 'RHS tracker')}
+          ${field('Time at HSC', elapsed)}${field('Source', isLocalManual(row) ? 'Local' : 'Tracker')}
           ${field('Docked at', row.dockedAt ? fmtDate(row.dockedAt, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—')}${field(milestoneLabel, milestoneValue)}
         </div>
         <div class="form-row"><div class="field"><label for="bay-select">Assign a bay</label><select id="bay-select">${bayOptions}</select></div><div class="field"><label>Operational status</label><input readonly value="${escapeHtml(status)}" aria-label="Operational status"></div></div>
@@ -873,7 +886,7 @@
     try {
       await replaceScheduleRecord(updated, action, detail);
       closeModal();
-      toast(type === 'CASE2' ? 'Movement marked Arrived. The marshall view retains it for up to two hours after HSC arrival.' : 'Movement marked Dispatched and audit log updated.', 'success');
+      toast(type === 'CASE2' ? 'Movement marked Arrived.' : 'Movement marked Dispatched.', 'success');
     } catch (error) { toast(error.message || 'Could not update movement status.', 'error', 8000); }
   }
 
@@ -895,18 +908,17 @@
     modal.id = 'add-schedule-modal';
     const nowClock = fmtClock(new Date());
     modal.innerHTML = `<section class="modal wide-modal" role="dialog" aria-modal="true" aria-labelledby="manual-title">
-      <header class="modal-header"><div><div class="eyebrow">Local schedule entry · ${escapeHtml(shift.label)}</div><h2 id="manual-title">Add a manual movement</h2><p>Create a schedule that is missing from the tracker.</p></div><button class="modal-close" id="manual-close" aria-label="Close">×</button></header>
+      <header class="modal-header"><div><div class="eyebrow">${escapeHtml(shift.label)}</div><h2 id="manual-title">Add a manual movement</h2></div><button class="modal-close" id="manual-close" aria-label="Close">×</button></header>
       <form id="manual-schedule-form" class="modal-body">
-        <div class="notice warning"><strong>Stored on this device only.</strong> This movement and its bay/completion changes will be saved in this browser's local storage. It will not be written to the shared spreadsheet or shown on the public yard marshall link.</div>
         <div class="form-row"><div class="field"><label for="manual-client">Client *</label><input name="client" id="manual-client" required maxlength="120" placeholder="Client name"></div><div class="field"><label for="manual-broker">Broker</label><input name="broker" id="manual-broker" maxlength="120" placeholder="Broker name"></div></div>
         <div class="form-row"><div class="field"><label for="manual-hsc">HSC *</label><input name="hsc" id="manual-hsc" required value="UB11" list="manual-hsc-options"><datalist id="manual-hsc-options"><option value="UB11"><option value="NG15"><option value="WS2"></datalist></div><div class="field"><label for="manual-load-type">Load type tag *</label><input name="loadType" id="manual-load-type" required value="Intercity" maxlength="80" placeholder="Intercity, Returns, International…"></div></div>
         <div class="form-row"><div class="field"><label for="manual-postcode">Postcode / route *</label><input name="postcode" id="manual-postcode" required maxlength="100" placeholder="e.g. UB11 → TW4 6HB"></div><div class="field"><label for="manual-vehicle-type">Vehicle type</label><input name="vehicleType" id="manual-vehicle-type" maxlength="50" placeholder="e.g. ARTIC, 18T"></div></div>
         <div class="form-row"><div class="field"><label for="manual-reg">Vehicle registration</label><input name="reg" id="manual-reg" maxlength="20" placeholder="e.g. AB12 CDE"></div><div class="field"><label for="manual-driver">Driver name</label><input name="driverName" id="manual-driver" maxlength="100" placeholder="Driver name"></div></div>
         <div class="form-row"><div class="field"><label for="manual-scheduled-time">Scheduled time for timeline *</label><input name="scheduledTime" id="manual-scheduled-time" type="time" required value="${escapeHtml(nowClock)}"></div><div class="field"><label for="manual-pallets">Pallets</label><input name="pallets" id="manual-pallets" inputmode="decimal" maxlength="30" placeholder="e.g. 12"></div></div>
-        <div class="form-row"><div class="field"><label for="manual-bags">Bags / loose parcels</label><input name="bagsLooseParcels" id="manual-bags" maxlength="80" placeholder="e.g. 24 bags"></div><div class="field"><label for="manual-planned-arrival">Planned arrival (H)</label><input name="plannedArrival" id="manual-planned-arrival" type="time"></div></div>
-        <div class="form-row"><div class="field"><label for="manual-actual-arrival">Actual arrival (I)</label><input name="actualArrival" id="manual-actual-arrival" type="time"></div><div class="field"><label for="manual-planned-pull">Planned pull (J)</label><input name="plannedPull" id="manual-planned-pull" type="time"></div></div>
-        <div class="form-row"><div class="field"><label for="manual-actual-pull">Actual pull (K)</label><input name="actualPull" id="manual-actual-pull" type="time"></div><div class="field"><label for="manual-eta-hsc">ETA to HSC (L)</label><input name="etaToHsc" id="manual-eta-hsc" type="time"></div></div>
-        <div class="form-row"><div class="field"><label for="manual-actual-arrival-hsc">Actual arrival time at HSC (M)</label><input name="actualArrivalHsc" id="manual-actual-arrival-hsc" type="time"></div><div class="field"><label>Shift window</label><input readonly value="${escapeHtml(fmtDate(shift.start, { day: '2-digit', month: 'short', year: 'numeric' }))} ${escapeHtml(fmtClock(shift.start))} to ${escapeHtml(fmtDate(shift.end, { day: '2-digit', month: 'short', year: 'numeric' }))} ${escapeHtml(fmtClock(shift.end))}"></div></div>
+        <div class="form-row"><div class="field"><label for="manual-bags">Bags / loose parcels</label><input name="bagsLooseParcels" id="manual-bags" maxlength="80" placeholder="e.g. 24 bags"></div><div class="field"><label for="manual-planned-arrival">Planned arrival</label><input name="plannedArrival" id="manual-planned-arrival" type="time"></div></div>
+        <div class="form-row"><div class="field"><label for="manual-actual-arrival">Actual arrival</label><input name="actualArrival" id="manual-actual-arrival" type="time"></div><div class="field"><label for="manual-planned-pull">Planned pull</label><input name="plannedPull" id="manual-planned-pull" type="time"></div></div>
+        <div class="form-row"><div class="field"><label for="manual-actual-pull">Actual pull</label><input name="actualPull" id="manual-actual-pull" type="time"></div><div class="field"><label for="manual-eta-hsc">ETA to HSC</label><input name="etaToHsc" id="manual-eta-hsc" type="time"></div></div>
+        <div class="form-row"><div class="field"><label for="manual-actual-arrival-hsc">Actual arrival at HSC</label><input name="actualArrivalHsc" id="manual-actual-arrival-hsc" type="time"></div><div class="field"><label>Shift window</label><input readonly value="${escapeHtml(fmtDate(shift.start, { day: '2-digit', month: 'short', year: 'numeric' }))} ${escapeHtml(fmtClock(shift.start))} to ${escapeHtml(fmtDate(shift.end, { day: '2-digit', month: 'short', year: 'numeric' }))} ${escapeHtml(fmtClock(shift.end))}"></div></div>
         <p id="manual-form-error" class="form-error hidden" role="alert"></p>
         <div class="modal-footer"><button type="button" class="btn danger" id="manual-cancel">Cancel</button><div class="right-actions"><button type="submit" class="btn primary">Add to this device</button></div></div>
       </form></section>`;
@@ -917,7 +929,7 @@
     modal.addEventListener('click', event => { if (event.target === modal) close(); });
     $('#manual-hsc', modal).addEventListener('change', () => {
       const hsc = textValue($('#manual-hsc', modal).value).toUpperCase();
-      $('#manual-eta-hsc', modal).closest('.field').querySelector('label').textContent = hsc === 'UB11' ? 'ETA to HSC (L), used for timeline' : 'ETA to HSC (L)';
+      $('#manual-eta-hsc', modal).closest('.field').querySelector('label').textContent = 'ETA to HSC';
     });
     $('#manual-schedule-form', modal).addEventListener('submit', event => {
       event.preventDefault();
@@ -963,7 +975,7 @@
         saveLocalManualRow(record);
         setCurrentRowsFromAll();
         renderWarehouse();
-        toast('Manual movement added. It is saved on this device only.', 'success', 5000);
+        toast('Schedule added.', 'success');
         $('#add-schedule-modal')?.remove();
       } catch (saveError) {
         error.textContent = saveError.message || 'Could not save this local schedule.';
@@ -1012,13 +1024,13 @@
       isLocalManual(row) ? 'Local only' : 'RHS tracker'
     ];
   }
-  const REPORT_HEADERS = ['Scheduled time', 'Status', 'Client', 'Broker', 'HSC', 'Load type', 'Route / postcode', 'Vehicle reg', 'Driver', 'Vehicle type', 'Bay', 'Pallets', 'Bags / loose parcels', 'Planned arrival (H)', 'Actual arrival (I)', 'Planned pull (J)', 'Actual pull (K)', 'ETA to HSC (L)', 'Actual arrival at HSC (M)', 'Time at HSC', 'Milestone time', 'Record source'];
+  const REPORT_HEADERS = ['Scheduled time', 'Status', 'Client', 'Broker', 'HSC', 'Load type', 'Route / postcode', 'Vehicle reg', 'Driver', 'Vehicle type', 'Bay', 'Pallets', 'Bags / loose parcels', 'Planned arrival', 'Actual arrival', 'Planned pull', 'Actual pull', 'ETA to HSC', 'Actual arrival at HSC', 'Time at HSC', 'Milestone time', 'Record source'];
   function reportSummaryHtml(shift, rows) {
     const dispatched = rows.filter(row => statusFor(row) === 'Dispatched').length;
     const arrived = rows.filter(row => statusFor(row) === 'Arrived').length;
     const docked = rows.filter(row => statusFor(row) === 'Docked').length;
     const manual = rows.filter(isLocalManual).length;
-    return `<div class="report-summary-grid"><div><small>Total movements</small><strong>${rows.length}</strong></div><div><small>Dispatched</small><strong>${dispatched}</strong></div><div><small>Arrived</small><strong>${arrived}</strong></div><div><small>Docked</small><strong>${docked}</strong></div><div><small>Manual entries</small><strong>${manual}</strong></div></div><p class="report-meta">${escapeHtml(shift.label)} shift · ${escapeHtml(fmtDate(shift.start, { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' }))} · ${escapeHtml(fmtClock(shift.start))}–${escapeHtml(fmtClock(shift.end))}. Generated ${escapeHtml(fmtDate(new Date(), { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }))}.</p>${manual ? '<p class="report-local-note">This report contains manual movements stored only in this browser. They are not included in the public spreadsheet or yard marshall view.</p>' : ''}`;
+    return `<div class="report-summary-grid"><div><small>Total movements</small><strong>${rows.length}</strong></div><div><small>Dispatched</small><strong>${dispatched}</strong></div><div><small>Arrived</small><strong>${arrived}</strong></div><div><small>Docked</small><strong>${docked}</strong></div><div><small>Manual entries</small><strong>${manual}</strong></div></div><p class="report-meta">${escapeHtml(shift.label)} shift · ${escapeHtml(fmtDate(shift.start, { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' }))} · ${escapeHtml(fmtClock(shift.start))}–${escapeHtml(fmtClock(shift.end))}. Generated ${escapeHtml(fmtDate(new Date(), { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }))}.</p>`;
   }
   function renderReportContent(container, shift) {
     const ordered = L.sortSchedule(rowsForShift(shift), 'BOTH', new Date());
@@ -1200,9 +1212,10 @@
     $('#main-nav').classList.remove('hidden');
     $$('.nav-tab').forEach(button => button.classList.toggle('active', button.dataset.view === 'yard'));
     const token = new URLSearchParams(location.search).get('token');
-    if (!token) { renderInvalidYard('This is the public preview, not a live marshall link. Ask the warehouse operator to generate the temporary shift link or QR code.'); return; }
+    if (!token) { renderInvalidYard('Invalid link.'); return; }
     renderLoading('Verifying the temporary shift link…');
     try {
+      // Read the same canonical Schedule tab that warehouse actions update. This avoids a separate public mirror getting out of sync.
       const [linkValues, scheduleValues] = await Promise.all([fetchPublicTab(cfg.destinationTabs.links), fetchPublicTab(cfg.destinationTabs.schedule)]);
       const tokenHash = await digestToken(token);
       const linkHeader = (linkValues[0] || []).map(L.normalizedHeader);
@@ -1214,7 +1227,7 @@
       const shiftStart = new Date(validLink[shiftStartIdx]);
       const shiftEnd = new Date(validLink[shiftEndIdx]);
       const now = new Date();
-      if (Number.isNaN(shiftEnd.getTime()) || now < shiftStart || now >= shiftEnd) throw new Error('This temporary link has expired or the shift has not started. Ask the warehouse operator for a current-shift link.');
+      if (Number.isNaN(shiftEnd.getTime()) || now < shiftStart || now >= shiftEnd) throw new Error('Link expired.');
       const sh = (scheduleValues[0] || []).map(L.normalizedHeader);
       const index = name => sh.indexOf(L.normalizedHeader(name));
       const idx = {
@@ -1223,13 +1236,20 @@
         actualArrivalHsc: index('ActualArrivalHSC'), pallets: index('Pallets'), bags: index('BagsLooseParcels'), reg: index('Reg'), driver: index('DriverName'), shiftStart: index('ShiftStartISO'),
         eventIso: index('EventTimeISO'), status: index('OperationalStatus'), bay: index('Bay'), completeAt: index('CompletedAt'), caseType: index('CaseType'), timeAtHSC: index('TimeAtHSCMinutes')
       };
+      if (idx.id < 0 || idx.shiftStart < 0 || idx.bay < 0 || idx.caseType < 0 || idx.eventIso < 0) {
+        throw new Error('Schedule unavailable. Ask the warehouse operator to sync the schedule and create a fresh link.');
+      }
+      const activeShiftStartMs = shiftStart.getTime();
       const schedule = scheduleValues.slice(1).map(row => ({
         id: textValue(row[idx.id]), sourceDate: textValue(row[idx.sourceDate]), client: textValue(row[idx.client]), broker: textValue(row[idx.broker]), hsc: textValue(row[idx.hsc]), loadType: textValue(row[idx.loadType]), code: textValue(row[idx.code]), postcode: textValue(row[idx.postcode]),
         vehicleType: textValue(row[idx.vehicleType]), plannedArrival: textValue(row[idx.plannedArrival]), actualArrival: textValue(row[idx.actualArrival]), plannedPull: textValue(row[idx.plannedPull]), actualPull: textValue(row[idx.actualPull]),
         etaToHsc: textValue(row[idx.etaToHsc]), actualArrivalHsc: textValue(row[idx.actualArrivalHsc]), pallets: textValue(row[idx.pallets]), bagsLooseParcels: textValue(row[idx.bags]), reg: textValue(row[idx.reg]), driverName: textValue(row[idx.driver]),
         shiftStartISO: textValue(row[idx.shiftStart]), eventTimeISO: textValue(row[idx.eventIso]), operationalStatus: textValue(row[idx.status]), bay: textValue(row[idx.bay]), completedAt: textValue(row[idx.completeAt]), caseType: textValue(row[idx.caseType]),
         timeAtHSCMinutes: row[idx.timeAtHSC] === '' || row[idx.timeAtHSC] == null ? '' : Number(row[idx.timeAtHSC])
-      })).filter(row => row.id && row.shiftStartISO === shiftStart.toISOString());
+      })).filter(row => {
+        const rowShiftStart = new Date(row.shiftStartISO).getTime();
+        return Boolean(row.id && row.bay && Number.isFinite(rowShiftStart) && rowShiftStart === activeShiftStartMs);
+      });
       state.activeShift = { start: shiftStart, end: shiftEnd, type: shiftStart.getHours() === cfg.dayShiftEndHour ? 'NIGHT' : 'DAY', label: shiftStart.getHours() === cfg.dayShiftEndHour ? '19:00–07:00' : '07:00–19:00' };
       const locallyCompleted = new Set(state.yardCompletedIds || []);
       state.shiftRows = L.sortSchedule(schedule.filter(row => !locallyCompleted.has(row.id) && L.isMarshallVisible(row, now, cfg.yardWindowMinutes)), 'BOTH', now);
@@ -1244,26 +1264,26 @@
   }
 
   function renderInvalidYard(message) {
-    root.innerHTML = `<section class="login-panel"><div class="login-symbol">⌖</div><div class="eyebrow">Yard marshall access</div><h1>Temporary access unavailable.</h1><p>${escapeHtml(message)}</p><div class="notice warning"><strong>Access note:</strong> The destination workbook must be shared as “Anyone with the link · Viewer” for the public marshall view to work. This link is read-only and expires at the end of its shift.</div><button class="btn" id="go-warehouse">Warehouse sign-in</button></section>`;
+    root.innerHTML = `<section class="login-panel"><div class="login-symbol">⌖</div><div class="eyebrow">RELAY</div><h1>Yard schedule unavailable</h1><p>${escapeHtml(message)}</p><button class="btn" id="go-warehouse">Back</button></section>`;
     $('#go-warehouse')?.addEventListener('click', () => navigate('warehouse'));
   }
   function renderYard(allCurrent) {
     const shift = state.activeShift || activeShift();
-    const until = new Date(Date.now() + cfg.yardWindowMinutes * 60000);
+    const now = new Date();
+    const until = new Date(now.getTime() + cfg.yardWindowMinutes * 60000);
     const list = state.shiftRows;
-    root.innerHTML = `<section class="yard-banner"><div><div class="eyebrow" style="color:#9db7ff">Live yard visibility</div><h1>Yard marshall schedule</h1><p>Only bay-assigned movements appear. Case 1 remains until Actual Pull, Case 2 for two hours after Actual arrival time HSC, and Returns for one hour after Actual Arrival.</p></div><div class="yard-time-window"><strong>${fmtClock(new Date())}–${fmtClock(until)}</strong><span>CASE-SPECIFIC VISIBILITY</span></div></section>
-      <div class="yard-refresh"><div><span class="yard-only-label">TEMPORARY LINK VERIFIED</span><div class="section-title">${escapeHtml(shift.label)} shift · ${escapeHtml(fmtDate(shift.start, { weekday: 'short', day: '2-digit', month: 'short' }))}</div><p>Updated ${fmtClock(new Date())} · Automatic refresh every minute</p></div><span class="yard-readonly">READ-ONLY LEDGER</span></div>
-      ${list.length ? `<div class="schedule-list">${list.map((row, index) => renderYardCard(row, index)).join('')}</div>` : `<div class="empty-state"><div class="empty-icon">⌖</div><h3>No bay-assigned movements to display</h3><p>Only bay-assigned movements are shown. Case 1 stays until Actual Pull is recorded, Case 2 stays for two hours after Actual arrival time HSC, and Returns stay for one hour after Actual Arrival.</p></div>`}
-      <div class="notice" style="margin-top:18px"><strong>Marshall completion:</strong> Mark complete hides a movement on this phone/browser only. Because this public link is read-only, it does not change the shared warehouse ledger. The link stops working at ${escapeHtml(fmtDate(shift.end, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }))}.</div>`;
+    root.innerHTML = `<section class="yard-banner"><div><div class="eyebrow" style="color:#9db7ff">RELAY OPERATIONS</div><h1>Yard schedule</h1></div><div class="yard-time-window"><strong>${fmtClock(now)}–${fmtClock(until)}</strong><span>NEXT 2 HOURS</span></div></section>
+      <div class="yard-refresh"><div><div class="section-title">${escapeHtml(shift.label)} · ${escapeHtml(fmtDate(shift.start, { weekday: 'short', day: '2-digit', month: 'short' }))}</div><p>Updated ${fmtClock(now)}</p></div></div>
+      ${list.length ? `<div class="schedule-list">${list.map((row, index) => renderYardCard(row, index)).join('')}</div>` : `<div class="empty-state"><div class="empty-icon">⌖</div><h3>No movements assigned</h3></div>`}`;
     $$('[data-yard-complete]', root).forEach(button => button.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
       const id = button.dataset.yardComplete;
       const row = state.shiftRows.find(item => item.id === id);
       if (!row) return;
-      if (window.confirm(`Mark ${row.reg || row.client || 'this movement'} complete on this Marshall device? This will hide it here only and will not update the warehouse ledger.`)) {
+      if (window.confirm(`Mark ${row.reg || row.client || 'this movement'} complete?`)) {
         try { markYardRowCompleted(id); }
-        catch (error) { toast(error.message || 'Could not hide this movement.', 'error', 6500); }
+        catch (error) { toast(error.message || 'Could not complete this movement.', 'error', 6500); }
       }
     }));
   }
@@ -1273,10 +1293,10 @@
     const dt = scheduleEventDate(row);
     const status = statusFor(row);
     const time = type === 'CASE3' ? (L.toMinutes(row.actualArrival) !== null ? fmtTime(row.actualArrival) : 'TBC') : (dt ? fmtClock(dt) : fmtTime(L.scheduledTime(row)));
-    const actualHsc = (type === 'CASE1' || type === 'CASE2') && L.toMinutes(row.actualArrivalHsc) !== null ? `<div class="actual-time-note">Actual HSC ${escapeHtml(fmtTime(row.actualArrivalHsc))}</div>` : '';
-    const eventLabel = type === 'CASE2' ? (status === 'Arrived' ? 'Actual arrival time HSC' : 'ETA to HSC') : (type === 'CASE3' && L.toMinutes(row.actualArrival) === null ? 'Arrival time pending' : (status === 'Arrived' ? 'Arrived at HSC' : (status === 'Dispatched' ? 'Dispatched' : 'Scheduled movement')));
+    const actualHsc = (type === 'CASE1' || type === 'CASE2') && L.toMinutes(row.actualArrivalHsc) !== null ? `<div class="actual-time-note">Actual arrival at HSC ${escapeHtml(fmtTime(row.actualArrivalHsc))}</div>` : '';
+    const eventLabel = type === 'CASE2' ? 'ETA to HSC' : (type === 'CASE3' && L.toMinutes(row.actualArrival) === null ? 'Arrival time pending' : (status === 'Arrived' ? 'Arrived at HSC' : (status === 'Dispatched' ? 'Dispatched' : 'Scheduled movement')));
     const elapsed = type === 'CASE2' ? elapsedForRow(row) : '';
-    return `<article class="schedule-card"><div class="card-main"><div class="time-column"><div class="event-time">${escapeHtml(time)}</div><div class="event-label">${escapeHtml(eventLabel)}</div>${actualHsc}</div><div class="client-area"><div class="client-line"><span class="client-name">${escapeHtml(row.client || 'Unassigned client')}</span><span class="load-type-tag">${escapeHtml(row.loadType || 'Load type not set')}</span>${vehicleIconHtml(row)}<span class="status-pill ${status.toLowerCase()}">${escapeHtml(status)}</span></div><div class="client-meta"><span><b>HSC</b> ${escapeHtml(row.hsc || '—')}</span><span><b>Broker</b> ${escapeHtml(row.broker || '—')}</span><span><b>Driver</b> ${escapeHtml(row.driverName || '—')}</span><span><b>Route</b> ${escapeHtml(routeLabel(row))}</span><span><b>Planned H / Actual I</b> ${escapeHtml(fmtTime(row.plannedArrival))} / ${escapeHtml(fmtTime(row.actualArrival))}</span><span><b>ETA / Actual HSC</b> ${escapeHtml(fmtTime(row.etaToHsc))} / ${escapeHtml(fmtTime(row.actualArrivalHsc))}</span></div></div><div class="card-right"><div class="plate"><span class="gb">GB</span><strong>${escapeHtml(row.reg || 'NO REG')}</strong></div><div class="bay-badge assigned">${escapeHtml(row.bay)}</div></div></div><div class="card-bottom"><div class="card-bottom-left"><span class="volume-chip"><i>▤</i> ${escapeHtml(row.pallets || '—')} pallets</span><span class="volume-chip"><i>▧</i> ${escapeHtml(row.bagsLooseParcels || '—')} bags / loose parcels</span>${elapsed ? `<span class="volume-chip"><i>◷</i> Time at HSC <b>${escapeHtml(elapsed)}</b></span>` : ''}</div><div class="card-bottom-right yard-card-actions"><span>${escapeHtml(row.code || '')}</span><button type="button" class="btn yard-complete-button" data-yard-complete="${escapeHtml(row.id)}">✓ Mark complete</button></div></div></article>`;
+    return `<article class="schedule-card"><div class="card-main"><div class="time-column"><div class="event-time">${escapeHtml(time)}</div><div class="event-label">${escapeHtml(eventLabel)}</div>${actualHsc}</div><div class="client-area"><div class="client-line"><span class="client-name">${escapeHtml(row.client || 'Unassigned client')}</span><span class="load-type-tag">${escapeHtml(row.loadType || 'Load type not set')}</span>${vehicleIconHtml(row)}<span class="status-pill ${status.toLowerCase()}">${escapeHtml(status)}</span></div><div class="client-meta"><span><b>HSC</b> ${escapeHtml(row.hsc || '—')}</span><span><b>Broker</b> ${escapeHtml(row.broker || '—')}</span><span><b>Driver</b> ${escapeHtml(row.driverName || '—')}</span><span><b>Route</b> ${escapeHtml(routeLabel(row))}</span><span><b>Planned / actual arrival</b> ${escapeHtml(fmtTime(row.plannedArrival))} / ${escapeHtml(fmtTime(row.actualArrival))}</span><span><b>ETA / actual arrival at HSC</b> ${escapeHtml(fmtTime(row.etaToHsc))} / ${escapeHtml(fmtTime(row.actualArrivalHsc))}</span></div></div><div class="card-right"><div class="plate"><span class="gb">GB</span><strong>${escapeHtml(row.reg || 'NO REG')}</strong></div><div class="bay-badge assigned">${escapeHtml(row.bay)}</div></div></div><div class="card-bottom"><div class="card-bottom-left"><span class="volume-chip"><i>▤</i> ${escapeHtml(row.pallets || '—')} pallets</span><span class="volume-chip"><i>▧</i> ${escapeHtml(row.bagsLooseParcels || '—')} bags / loose parcels</span>${elapsed ? `<span class="volume-chip"><i>◷</i> Time at HSC <b>${escapeHtml(elapsed)}</b></span>` : ''}</div><div class="card-bottom-right yard-card-actions"><span>${escapeHtml(row.code || '')}</span><button type="button" class="btn yard-complete-button" data-yard-complete="${escapeHtml(row.id)}">✓ Mark complete</button></div></div></article>`;
   }
 
   function navigate(view) {
@@ -1315,7 +1335,7 @@
   }
   function renderStartupError(message) {
     if (!root) return;
-    root.innerHTML = `<section class="login-panel"><div class="login-symbol">!</div><div class="eyebrow">Warehouse control desk</div><h1>Relay could not start.</h1><p>The app detected a startup problem instead of leaving the loading screen running indefinitely.</p><div class="notice error"><strong>Startup error:</strong> ${escapeHtml(message)}</div><p>Check that <code>config.js</code>, <code>logic.js</code> and <code>app.js</code> are uploaded together from the same project version.</p><button id="retry-app" class="btn primary">Reload application</button></section>`;
+    root.innerHTML = `<section class="login-panel"><div class="login-symbol">!</div><div class="eyebrow">Warehouse control desk</div><h1>Relay could not start.</h1><div class="notice error">${escapeHtml(message)}</div><button id="retry-app" class="btn primary">Reload application</button></section>`;
     $('#retry-app')?.addEventListener('click', () => location.reload());
   }
   async function boot() {
