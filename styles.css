@@ -48,3 +48,14 @@
   body.printing-report #shift-report-modal .report-summary-grid strong{font-size:15px}
   body.printing-report #shift-report-modal .report-meta,body.printing-report #shift-report-modal .report-local-note{font-size:8pt}
 }
+
+/* Vehicle class icons and explicit arrival/departure milestones. */
+.status-pill.arrived{background:#e7f3ff;color:#145ba8}.status-pill.dispatched{background:#e1f6e9;color:#087346}
+.vehicle-type-icon{display:inline-flex;align-items:center;gap:4px;height:30px;padding:2px 6px;border:1px solid #e7ebf2;border-radius:8px;background:#fff;color:#52617d;font-size:9px;font-weight:800;white-space:nowrap}
+.vehicle-type-icon img{display:block;width:48px;height:26px;object-fit:contain;background:#fff;border-radius:4px}
+.vehicle-type-unknown{height:28px}
+.vehicle-type-unknown span:first-child{font-size:17px}
+@media(max-width:580px){.vehicle-type-icon{height:27px;padding:2px 4px}.vehicle-type-icon img{width:39px;height:22px}.vehicle-type-icon span{font-size:8px}}
+
+/* Keep Marshall completion action visible on narrow/mobile screens. */
+.yard-card-actions{display:flex!important;align-items:center;gap:10px;flex-wrap:wrap}.yard-complete-button{padding:8px 10px;font-size:11px;white-space:nowrap}
